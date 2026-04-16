@@ -15,22 +15,94 @@ from pathlib import Path
 # Inject a stub TD runtime BEFORE importing td_api.
 _stub = types.ModuleType("td_runtime")
 
+
+class _FakePar:
+    """Stand-in for a TD parameter. Has .val (mutable) and .eval (property)."""
+    def __init__(self, val):
+        self.val = val
+    @property
+    def eval(self):
+        return self.val
+
+
+class _FakeParGroup:
+    """Stand-in for `op.par` — exposes parameters as attributes."""
+    def __init__(self, initial: dict | None = None):
+        self._pars: dict[str, _FakePar] = {}
+        for k, v in (initial or {}).items():
+            self._pars[k] = _FakePar(v)
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if name not in self._pars:
+            raise AttributeError(name)
+        return self._pars[name]
+
+    def __setattr__(self, name, value):
+        if name == "_pars":
+            object.__setattr__(self, name, value)
+            return
+        # Setting par creates or updates a _FakePar.
+        self._pars[name] = _FakePar(value)
+
+    def __dir__(self):
+        return [n for n in self._pars.keys() if not n.startswith("_")]
+
+
 class _FakeOp:
     def __init__(self, path="/", name="root", type_="root", family="COMP"):
         self.path = path
         self.name = name
         self.type = type_
         self.family = family
-        self._children = []
-        self._pars = {}
+        self._children: list["_FakeOp"] = []
+        self.par = _FakeParGroup({"tx": 0, "ty": 0})
+        self.selected = False
+        self.inputConnectors: list = []
+        self.outputConnectors: list = []
+        self.nodeX = 0
+        self.nodeY = 0
+
     def findChildren(self, depth=1):
-        return list(self._children)
+        out = list(self._children)
+        if depth > 1:
+            for c in self._children:
+                out.extend(c.findChildren(depth=depth - 1))
+        return out
+
     def errors(self): return ""
     def warnings(self): return ""
 
-_stub.op = lambda path=None: _FakeOp(path or "/")
+    def create(self, type_, name=None):
+        child_name = name or type_
+        child = _FakeOp(
+            path=f"{self.path.rstrip('/')}/{child_name}",
+            name=child_name, type_=type_, family="SOP",
+        )
+        self._children.append(child)
+        _op_registry[child.path] = child
+        return child
+
+    def save(self, filepath):
+        # Minimal PNG signature + padding so test_screenshot_png can detect it.
+        Path(filepath).write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
+
+
+# Registry so repeated op(path) calls return the same instance.
+_op_registry: dict[str, _FakeOp] = {}
+
+
+def _stub_op(path=None):
+    p = path or "/"
+    if p not in _op_registry:
+        _op_registry[p] = _FakeOp(path=p, name=p.rsplit("/", 1)[-1] or "root")
+    return _op_registry[p]
+
+
+_stub.op = _stub_op
 _stub.ui = types.SimpleNamespace(panes=types.SimpleNamespace(current=types.SimpleNamespace(
-    owner=_FakeOp("/"), x=0, y=0, zoom=1.0)))
+    owner=_stub_op("/"), x=0, y=0, zoom=1.0)))
 _stub.ops = lambda *args: []
 sys.modules["td_runtime"] = _stub
 
@@ -183,6 +255,66 @@ class ServerTest(unittest.TestCase):
         data = json.loads(body)
         self.assertTrue(data["success"])
         self.assertIn("oops", data["stderr"])
+
+    def test_params_read(self):
+        status, body = self._req("/params?path=/foo", token=self.token)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["path"], "/foo")
+        self.assertIn("params", data)
+        self.assertIn("tx", data["params"])
+
+    def test_params_missing_path_returns_400(self):
+        status, _ = self._req("/params", token=self.token)
+        self.assertEqual(status, 400)
+
+    def test_params_write(self):
+        status, body = self._req(
+            "/params?path=/bar", token=self.token, method="PATCH",
+            body=json.dumps({"tx": 5}),
+            headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["applied"].get("tx"), 5)
+        # Read it back
+        status, body = self._req("/params?path=/bar", token=self.token)
+        self.assertEqual(json.loads(body)["params"]["tx"], 5)
+
+    def test_create_operator(self):
+        payload = {"type": "geo", "parent": "/", "name": "geoA", "pos": [100, 200]}
+        status, body = self._req(
+            "/create", token=self.token, method="POST",
+            body=json.dumps(payload),
+            headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["name"], "geoA")
+        self.assertEqual(data["type"], "geo")
+
+    def test_create_missing_type_returns_400(self):
+        status, _ = self._req(
+            "/create", token=self.token, method="POST",
+            body=json.dumps({"parent": "/"}),
+            headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 400)
+
+    def test_graph(self):
+        status, body = self._req("/graph?path=/&depth=2", token=self.token)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["path"], "/")
+        self.assertEqual(data["depth"], 2)
+        self.assertIsInstance(data["nodes"], list)
+
+    def test_screenshot_png(self):
+        # Create a TOP-like op that has .save(). Any op in our stub has .save.
+        status, body = self._req("/screenshot?path=/topA", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(body[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_screenshot_missing_path_returns_400(self):
+        status, _ = self._req("/screenshot", token=self.token)
+        self.assertEqual(status, 400)
 
 
 if __name__ == "__main__":

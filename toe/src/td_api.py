@@ -14,6 +14,7 @@ import json
 import os
 import secrets
 import sys
+import tempfile
 import threading
 import traceback
 from collections import deque
@@ -325,3 +326,144 @@ def _execute(ctx: Ctx):
             "from_op": from_op,
             "error": {"type": type(exc).__name__, "message": str(exc)},
         }
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — mutation & complex
+# ---------------------------------------------------------------------------
+
+@route("GET", "/params")
+def _params_get(ctx: Ctx):
+    td = _td()
+    path = ctx.q("path")
+    if not path:
+        return 400, {"error": {"type": "BadInput", "message": "path required"}}
+    o = td.op(path)
+    if o is None:
+        return 404, {"error": {"type": "NotFound", "message": path}}
+    pars: dict[str, Any] = {}
+    try:
+        names = [n for n in dir(o.par) if not n.startswith("_")]
+    except Exception:  # noqa: BLE001
+        names = []
+    for name in names:
+        try:
+            val = getattr(o.par, name)
+            pars[name] = val.eval if hasattr(val, "eval") else val
+        except Exception:  # noqa: BLE001
+            pass
+    return 200, {"path": path, "params": pars}
+
+
+@route("PATCH", "/params")
+def _params_set(ctx: Ctx):
+    td = _td()
+    path = ctx.q("path")
+    if not path:
+        return 400, {"error": {"type": "BadInput", "message": "path required"}}
+    o = td.op(path)
+    if o is None:
+        return 404, {"error": {"type": "NotFound", "message": path}}
+    updates = ctx.json() or {}
+    applied: dict[str, Any] = {}
+    for k, v in updates.items():
+        par = getattr(o.par, k, None)
+        try:
+            if par is not None and hasattr(par, "val"):
+                par.val = v
+            else:
+                # Create-or-set via attribute — _FakeParGroup and TD both support this.
+                setattr(o.par, k, v)
+            applied[k] = v
+        except Exception as exc:  # noqa: BLE001
+            applied[k] = {"error": str(exc)}
+    return 200, {"path": path, "applied": applied}
+
+
+@route("POST", "/create")
+def _create(ctx: Ctx):
+    td = _td()
+    data = ctx.json() or {}
+    type_ = data.get("type")
+    parent = data.get("parent", "/")
+    name = data.get("name")
+    pos = data.get("pos")
+    inputs = data.get("inputs") or []
+    if not type_:
+        return 400, {"error": {"type": "BadInput", "message": "type required"}}
+    p = td.op(parent)
+    if p is None:
+        return 404, {"error": {"type": "NotFound", "message": parent}}
+    if not hasattr(p, "create"):
+        return 500, {"error": {"type": "CreateFailed", "message": "op has no create()"}}
+    child = p.create(type_, name=name)
+    if pos and hasattr(child, "nodeX"):
+        try:
+            child.nodeX, child.nodeY = int(pos[0]), int(pos[1])
+        except Exception:  # noqa: BLE001
+            pass
+    for i, src in enumerate(inputs):
+        s = td.op(src)
+        if s is None:
+            continue
+        try:
+            child.inputConnectors[i].connect(s.outputConnectors[0])
+        except Exception:  # noqa: BLE001
+            pass
+    return 200, _op_info(child)
+
+
+@route("GET", "/graph")
+def _graph(ctx: Ctx):
+    td = _td()
+    path = ctx.q("path", "/") or "/"
+    try:
+        depth = int(ctx.q("depth", "2") or "2")
+    except ValueError:
+        return 400, {"error": {"type": "BadInput", "message": "depth must be integer"}}
+    root = td.op(path)
+    if root is None:
+        return 404, {"error": {"type": "NotFound", "message": path}}
+    nodes: list[dict] = []
+
+    def walk(n, d):
+        inputs: list[str] = []
+        for ic in getattr(n, "inputConnectors", []) or []:
+            for conn in getattr(ic, "connections", []) or []:
+                owner = getattr(conn, "owner", None)
+                if owner is not None:
+                    owner_path = getattr(owner, "path", None)
+                    if owner_path is not None:
+                        inputs.append(owner_path)
+        nodes.append({**_op_info(n), "inputs": inputs})
+        if d <= 0:
+            return
+        for c in n.findChildren(depth=1):
+            walk(c, d - 1)
+
+    walk(root, depth)
+    return 200, {"path": path, "depth": depth, "nodes": nodes}
+
+
+@route("GET", "/screenshot")
+def _screenshot(ctx: Ctx):
+    td = _td()
+    path = ctx.q("path")
+    if not path:
+        return 400, {"error": {"type": "BadInput", "message": "path required"}}
+    o = td.op(path)
+    if o is None:
+        return 404, {"error": {"type": "NotFound", "message": path}}
+    if not hasattr(o, "save"):
+        return 400, {"error": {"type": "BadOp", "message": "op has no .save (not a TOP?)"}}
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        tmp = f.name
+    try:
+        o.save(tmp)
+        data = Path(tmp).read_bytes()
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return 200, ("image/png", data)
