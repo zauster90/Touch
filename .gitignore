@@ -2,6 +2,9 @@ node_modules/
 # dist/ is intentionally committed for install-without-build UX
 .DS_Store
 *.log
+# Python bytecode cache
+__pycache__/
+*.pyc
 # TD junk
 *.toe.*.tmp
 *.tox.bak
