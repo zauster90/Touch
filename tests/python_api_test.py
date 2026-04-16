@@ -106,6 +106,44 @@ class ServerTest(unittest.TestCase):
         self.assertIsNone(resp.getheader("Access-Control-Allow-Origin"))
         conn.close()
 
+    # --- read-only endpoints ---
+    def test_pane_returns_state(self):
+        status, body = self._req("/pane", token=self.token)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertIn("networkPath", data)
+        self.assertIn("x", data)
+        self.assertIn("y", data)
+        self.assertIn("zoom", data)
+
+    def test_selection_returns_list(self):
+        status, body = self._req("/selection", token=self.token)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertIsInstance(data["operators"], list)
+
+    def test_operators_at_root(self):
+        status, body = self._req("/operators?path=/", token=self.token)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["path"], "/")
+        self.assertIsInstance(data["operators"], list)
+
+    def test_operators_default_path_is_root(self):
+        status, body = self._req("/operators", token=self.token)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["path"], "/")
+
+    def test_errors_returns_structure(self):
+        status, body = self._req("/errors", token=self.token)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertIn("errors", data)
+        self.assertIn("warnings", data)
+        self.assertIsInstance(data["errors"], list)
+        self.assertIsInstance(data["warnings"], list)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -230,3 +230,69 @@ def rotate_token() -> str:
     TDHandler.token = new
     log("TOKEN rotated")
     return new
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — read-only
+# ---------------------------------------------------------------------------
+
+def _op_info(o) -> dict:
+    return {
+        "path": getattr(o, "path", None),
+        "name": getattr(o, "name", None),
+        "type": getattr(o, "type", None),
+        "family": getattr(o, "family", None),
+    }
+
+
+@route("GET", "/pane")
+def _pane(ctx: Ctx):
+    td = _td()
+    pane = td.ui.panes.current
+    owner = pane.owner
+    return 200, {
+        "networkPath": getattr(owner, "path", "/"),
+        "x": getattr(pane, "x", 0),
+        "y": getattr(pane, "y", 0),
+        "zoom": getattr(pane, "zoom", 1.0),
+    }
+
+
+@route("GET", "/selection")
+def _selection(ctx: Ctx):
+    td = _td()
+    sel = getattr(td.ui, "selected", None)
+    if callable(sel):
+        ops = sel()
+    else:
+        # fallback: scan current pane owner for selected children
+        owner = td.ui.panes.current.owner
+        ops = [c for c in owner.findChildren(depth=1) if getattr(c, "selected", False)]
+    return 200, {"operators": [_op_info(o) for o in ops]}
+
+
+@route("GET", "/operators")
+def _operators(ctx: Ctx):
+    td = _td()
+    path = ctx.q("path", "/") or "/"
+    parent = td.op(path)
+    if parent is None:
+        return 404, {"error": {"type": "NotFound", "message": f"op not found: {path}"}}
+    kids = parent.findChildren(depth=1)
+    return 200, {"path": path, "operators": [_op_info(k) for k in kids]}
+
+
+@route("GET", "/errors")
+def _errors(ctx: Ctx):
+    td = _td()
+    root = td.op("/")
+    if root is None:
+        return 500, {"error": {"type": "NoRoot", "message": "cannot access op('/')"}}
+    errs: list[dict] = []
+    warns: list[dict] = []
+    for n in [root, *root.findChildren(depth=10)]:
+        e = n.errors() or ""
+        w = n.warnings() or ""
+        if e: errs.append({"path": n.path, "text": e})
+        if w: warns.append({"path": n.path, "text": w})
+    return 200, {"errors": errs, "warnings": warns}
