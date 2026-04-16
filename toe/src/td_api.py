@@ -7,7 +7,9 @@ This file is the authoritative source. It gets copied into a Text DAT inside
 Stdlib only — runs inside TD 2025's embedded Python (3.11)."""
 from __future__ import annotations
 
+import contextlib
 import hmac
+import io
 import json
 import os
 import secrets
@@ -296,3 +298,30 @@ def _errors(ctx: Ctx):
         if e: errs.append({"path": n.path, "text": e})
         if w: warns.append({"path": n.path, "text": w})
     return 200, {"errors": errs, "warnings": warns}
+
+
+@route("POST", "/execute")
+def _execute(ctx: Ctx):
+    td = _td()
+    code = ctx.body.decode("utf-8")
+    from_op = ctx.q("from_op", "/") or "/"
+    me = td.op(from_op)
+    stdout, stderr = io.StringIO(), io.StringIO()
+    scope = {"op": td.op, "ops": getattr(td, "ops", None), "ui": td.ui, "me": me}
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            exec(compile(code, "<td_execute>", "exec"), scope)  # noqa: S102
+        return 200, {
+            "success": True,
+            "stdout": stdout.getvalue(),
+            "stderr": stderr.getvalue(),
+            "from_op": from_op,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return 200, {
+            "success": False,
+            "stdout": stdout.getvalue(),
+            "stderr": stderr.getvalue(),
+            "from_op": from_op,
+            "error": {"type": type(exc).__name__, "message": str(exc)},
+        }

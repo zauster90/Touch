@@ -144,6 +144,46 @@ class ServerTest(unittest.TestCase):
         self.assertIsInstance(data["errors"], list)
         self.assertIsInstance(data["warnings"], list)
 
+    def test_execute_stdout(self):
+        status, body = self._req(
+            "/execute", token=self.token, method="POST",
+            body="print('hi')")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["success"])
+        self.assertIn("hi", data["stdout"])
+        self.assertEqual(data["from_op"], "/")
+
+    def test_execute_exception_returns_200_with_error(self):
+        status, body = self._req(
+            "/execute", token=self.token, method="POST",
+            body="raise ValueError('boom')")
+        self.assertEqual(status, 200)   # transport OK; code error surfaced in body
+        data = json.loads(body)
+        self.assertFalse(data["success"])
+        self.assertEqual(data["error"]["type"], "ValueError")
+        self.assertIn("boom", data["error"]["message"])
+
+    def test_execute_with_from_op(self):
+        status, body = self._req(
+            "/execute?from_op=/foo", token=self.token, method="POST",
+            body="print(me.path if me else 'no me')")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["success"])
+        self.assertEqual(data["from_op"], "/foo")
+        # stub op('/foo') returns a fresh _FakeOp with .path set to '/foo'
+        self.assertIn("/foo", data["stdout"])
+
+    def test_execute_captures_stderr(self):
+        status, body = self._req(
+            "/execute", token=self.token, method="POST",
+            body="import sys; print('oops', file=sys.stderr)")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["success"])
+        self.assertIn("oops", data["stderr"])
+
 
 if __name__ == "__main__":
     unittest.main()
