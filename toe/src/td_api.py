@@ -1,0 +1,232 @@
+"""TouchDesigner HTTP API — serves 127.0.0.1 only, token-authenticated.
+
+This file is the authoritative source. It gets copied into a Text DAT inside
+`TouchAPI.tox`. Regenerate the .tox after any change and run
+`scripts/extract_tox.py` to verify the round-trip.
+
+Stdlib only — runs inside TD 2025's embedded Python (3.11)."""
+from __future__ import annotations
+
+import hmac
+import json
+import os
+import secrets
+import sys
+import threading
+import traceback
+from collections import deque
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from typing import Any, Callable
+from urllib.parse import parse_qs, urlparse
+
+# TD runtime is injected (by the tox bootstrap) or stubbed (in tests).
+# We import lazily so test harnesses can inject a fake `td_runtime` module first.
+def _td():
+    import td_runtime  # type: ignore
+    return td_runtime
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+DEFAULT_PORT = 44444
+ALLOWED_HOSTS = {"localhost", "127.0.0.1"}
+LOG_MAX = 500
+
+
+def _config_dir() -> Path:
+    # Tests override via env var; otherwise use platform default.
+    override = os.environ.get("CLAUDE_TD_CONFIG_DIR")
+    if override:
+        return Path(override)
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "claude-td"
+    return Path.home() / ".config" / "claude-td"
+
+
+# ---------------------------------------------------------------------------
+# Token manager
+# ---------------------------------------------------------------------------
+
+class TokenManager:
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path or (_config_dir() / "token")
+
+    def load(self) -> str:
+        if not self.path.exists():
+            self._generate()
+        return self.path.read_text(encoding="utf-8").strip()
+
+    def rotate(self) -> str:
+        self._generate()
+        return self.load()
+
+    def _generate(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        token = secrets.token_urlsafe(32)
+        self.path.write_text(token, encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(self.path, 0o600)
+
+
+# ---------------------------------------------------------------------------
+# Request log
+# ---------------------------------------------------------------------------
+
+_log: deque[str] = deque(maxlen=LOG_MAX)
+
+
+def log(line: str) -> None:
+    _log.append(line)
+
+
+def get_log() -> list[str]:
+    return list(_log)
+
+
+# ---------------------------------------------------------------------------
+# Router — endpoints register via @route
+# ---------------------------------------------------------------------------
+
+Endpoint = Callable[["Ctx"], tuple[int, Any]]
+_routes: dict[tuple[str, str], Endpoint] = {}
+
+
+def route(method: str, path: str):
+    def deco(fn: Endpoint) -> Endpoint:
+        _routes[(method, path)] = fn
+        return fn
+    return deco
+
+
+class Ctx:
+    """Per-request context passed to endpoints."""
+    def __init__(self, handler: "TDHandler", query: dict[str, list[str]], body: bytes):
+        self.handler = handler
+        self.query = query
+        self.body = body
+
+    def q(self, key: str, default: str | None = None) -> str | None:
+        vals = self.query.get(key)
+        return vals[0] if vals else default
+
+    def json(self) -> Any:
+        if not self.body:
+            return None
+        return json.loads(self.body.decode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Handler
+# ---------------------------------------------------------------------------
+
+class TDHandler(BaseHTTPRequestHandler):
+    # Populated in start_server
+    token: str = ""
+
+    def log_message(self, fmt, *args):  # silence stderr; use our log buffer
+        log(f"{self.address_string()} - {fmt % args}")
+
+    # ---- middleware ------------------------------------------------------
+    def _host_ok(self) -> bool:
+        raw = self.headers.get("Host", "")
+        host = raw.split(":", 1)[0].lower()
+        return host in ALLOWED_HOSTS
+
+    def _auth_ok(self) -> bool:
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return False
+        provided = auth[len("Bearer "):].strip()
+        return hmac.compare_digest(provided, self.token)
+
+    def _deny(self, code: int, reason: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        log(f"DENY {code} {reason} {self.path}")
+
+    def _respond(self, status: int, body: Any, *, content_type: str = "application/json") -> None:
+        if isinstance(body, (bytes, bytearray)):
+            payload = bytes(body)
+        else:
+            payload = json.dumps(body).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        # NOTE: never send Access-Control-Allow-Origin.
+        self.end_headers()
+        self.wfile.write(payload)
+
+    # ---- dispatch --------------------------------------------------------
+    def _handle(self, method: str) -> None:
+        if not self._host_ok():
+            return self._deny(403, "bad_host")
+        if not self._auth_ok():
+            return self._deny(401, "bad_token")
+
+        parsed = urlparse(self.path)
+        key = (method, parsed.path)
+        endpoint = _routes.get(key)
+        if endpoint is None:
+            return self._deny(404, "no_route")
+
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+
+        ctx = Ctx(self, parse_qs(parsed.query), body)
+        try:
+            status, payload = endpoint(ctx)
+        except Exception as exc:  # noqa: BLE001
+            log(f"ERR {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+            return self._respond(500, {"error": {"type": type(exc).__name__, "message": str(exc)}})
+
+        if isinstance(payload, tuple) and len(payload) == 2 and isinstance(payload[1], (bytes, bytearray)):
+            # (content_type, bytes) form — for binary responses like PNG.
+            content_type, data = payload
+            return self._respond(status, data, content_type=content_type)
+
+        self._respond(status, payload)
+
+    def do_GET(self): self._handle("GET")
+    def do_POST(self): self._handle("POST")
+    def do_PATCH(self): self._handle("PATCH")
+
+
+# ---------------------------------------------------------------------------
+# Server lifecycle
+# ---------------------------------------------------------------------------
+
+_server: HTTPServer | None = None
+_server_thread: threading.Thread | None = None
+
+
+def start_server(host: str = "127.0.0.1", port: int = DEFAULT_PORT) -> HTTPServer:
+    global _server, _server_thread
+    assert host == "127.0.0.1", "Only 127.0.0.1 is permitted"
+    token = TokenManager().load()
+    TDHandler.token = token
+    _server = HTTPServer((host, port), TDHandler)
+    _server_thread = threading.Thread(target=_server.serve_forever, daemon=True)
+    _server_thread.start()
+    log(f"START on {host}:{_server.server_address[1]}")
+    return _server
+
+
+def stop_server() -> None:
+    global _server, _server_thread
+    if _server is not None:
+        _server.shutdown()
+        _server.server_close()
+    _server = None
+    _server_thread = None
+
+
+def rotate_token() -> str:
+    new = TokenManager().rotate()
+    TDHandler.token = new
+    log("TOKEN rotated")
+    return new
