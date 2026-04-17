@@ -49,6 +49,10 @@ beforeAll(async () => {
         return res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({path:"/geoA", name:"geoA", type:"geo"}));
       if (url.startsWith("/screenshot"))
         return res.writeHead(200, {"content-type":"image/png"}).end(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]));
+      if (url.startsWith("/layout"))
+        return res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({
+          mode: "preview", target: "/project1", plan: [], broken_edges: [], stats: {nodes: 0},
+        }));
       res.writeHead(404).end();
     });
   });
@@ -109,5 +113,29 @@ describe("td() client", () => {
     const call = calls.at(-1)!;
     expect(call.method).toBe("POST");
     expect(JSON.parse(call.body).type).toBe("geo");
+  });
+
+  it("layoutTool sends POST /layout with JSON body", async () => {
+    const { layoutTool } = await import("../src/index.js");
+    calls.length = 0;
+    const out = await layoutTool({ path: "/project1", apply: false });
+    const call = calls.at(-1)!;
+    expect(call.method).toBe("POST");
+    expect(call.url.startsWith("/layout")).toBe(true);
+    expect(JSON.parse(call.body).path).toBe("/project1");
+    expect(JSON.parse(call.body).apply).toBe(false);
+    expect(out.content[0].type).toBe("text");
+    const parsed = JSON.parse(out.content[0].text);
+    expect(parsed.mode).toBe("preview");
+    expect(parsed.target).toBe("/project1");
+  });
+
+  it("layoutTool forwards apply: true and direction: TB", async () => {
+    const { layoutTool } = await import("../src/index.js");
+    calls.length = 0;
+    await layoutTool({ path: "/x", apply: true, direction: "TB" });
+    const body = JSON.parse(calls.at(-1)!.body);
+    expect(body.apply).toBe(true);
+    expect(body.direction).toBe("TB");
   });
 });
