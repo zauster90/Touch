@@ -109,18 +109,18 @@ class CrossingReductionTest(unittest.TestCase):
 
 class BrandesKopfTest(unittest.TestCase):
     def test_parent_centered_over_children(self):
-        # root -> {a, b, c}. root's y should be roughly the middle of a/b/c's y.
+        # root -> {a, b, c}. root's y should be near the mean of a/b/c's y,
+        # and a/b/c must not collapse onto each other.
         nodes = [{"id": n, "is_feedback_top": False} for n in ("root", "a", "b", "c")]
         edges = [{"from": "root", "to": "a"},
                  {"from": "root", "to": "b"},
                  {"from": "root", "to": "c"}]
         result = td_layout.layout({"nodes": nodes, "edges": edges})
         p = result["positions"]
-        ys = sorted([p["a"][1], p["b"][1], p["c"][1]])
-        # Allow a small tolerance — Brandes-Kopf averages 4 alignments, so the root's y
-        # should be within the span of the children.
-        self.assertGreaterEqual(p["root"][1], ys[0])
-        self.assertLessEqual(p["root"][1], ys[-1])
+        ys = [p["a"][1], p["b"][1], p["c"][1]]
+        self.assertEqual(len(set(ys)), 3, "children must occupy distinct y positions")
+        mean_y = sum(ys) / 3
+        self.assertAlmostEqual(p["root"][1], mean_y, delta=15)
 
     def test_tb_direction_swaps_axes(self):
         result = td_layout.layout({

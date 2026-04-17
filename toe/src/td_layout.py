@@ -10,6 +10,8 @@ from __future__ import annotations
 from typing import Any
 
 DEFAULT_SPACING = {"rank": 150, "node": 30}
+RELAX_ITERS = 32       # empirically sufficient for graphs <= ~50 nodes
+PULL_FACTOR = 0.5      # under-relaxation factor; lower = slower but steadier
 
 
 def layout(graph: dict[str, Any]) -> dict[str, Any]:
@@ -233,31 +235,54 @@ def _assign_layers(ids: list[str], edges: list[dict]) -> list[list[str]]:
     return layers
 
 
-def _assign_coords(layers, edges, spacing, direction):
-    """Brandes-Kopf balanced coordinate assignment, averaged over 4 alignments."""
-    # For small graphs, the full 4-alignment algorithm converges to stable centered
-    # positions. Implementation: compute vertical coordinate ("order-axis") for each
-    # node as the mean of its neighbours' order-axis values, iterated to fixed point.
+def _assign_coords(
+    layers: list[list[str]],
+    edges: list[dict],
+    spacing: dict[str, int],
+    direction: str,
+) -> dict[str, tuple[int, int]]:
+    """Iterated-mean relaxation as a pragmatic stand-in for full Brandes-Köpf.
+
+    Each node is pulled toward the mean of its neighbours' order-axis values,
+    with a post-step spread pass that enforces a minimum gap of 1.0 to preserve
+    layer ordering.
+    """
     order_of: dict[str, float] = {}
     for row in layers:
         for j, n in enumerate(row):
             order_of[n] = float(j)
 
+    # Precompute neighbour lookups once (matches the pattern in _reduce_crossings).
+    in_nbrs: dict[str, list[str]] = {n: [] for row in layers for n in row}
+    out_nbrs: dict[str, list[str]] = {n: [] for row in layers for n in row}
+    for e in edges:
+        if e["from"] in in_nbrs and e["to"] in in_nbrs:
+            in_nbrs[e["to"]].append(e["from"])
+            out_nbrs[e["from"]].append(e["to"])
+
     # Relax: each non-terminal node's order-axis is the average of its neighbours'.
     # This is a simplification of full Brandes-Kopf that captures the essential
     # "center parent over children" property without the 200 LOC of block-alignment.
-    for _ in range(32):
+    for _ in range(RELAX_ITERS):
         new_order: dict[str, float] = dict(order_of)
-        for i, row in enumerate(layers):
+        for row in layers:
             for n in row:
-                up = [order_of[e["from"]] for e in edges if e["to"] == n and e["from"] in order_of]
-                down = [order_of[e["to"]] for e in edges if e["from"] == n and e["to"] in order_of]
+                up = [order_of[m] for m in in_nbrs[n]]
+                down = [order_of[m] for m in out_nbrs[n]]
                 neighbours = up + down
                 if neighbours:
-                    # Mean of neighbours, clamped to avoid collapsing layers (keep unique per layer).
+                    # Mean-pull; collapse is prevented by the min-gap pass below.
                     target = sum(neighbours) / len(neighbours)
-                    # Pull halfway toward target to preserve layer ordering.
-                    new_order[n] = (order_of[n] + target) / 2.0
+                    new_order[n] = order_of[n] + PULL_FACTOR * (target - order_of[n])
+        # Spread pass: preserve relative order within each layer, enforce min gap of 1.0.
+        for row in layers:
+            row_sorted = sorted(row, key=lambda n: new_order[n])
+            for j, n in enumerate(row_sorted):
+                if j == 0:
+                    continue
+                prev_order = new_order[row_sorted[j - 1]]
+                if new_order[n] < prev_order + 1.0:
+                    new_order[n] = prev_order + 1.0
         order_of = new_order
 
     # Map to pixel coords. Stripped (non-dummy) layers are in `layers` already.
