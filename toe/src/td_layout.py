@@ -19,36 +19,30 @@ def layout(graph: dict[str, Any]) -> dict[str, Any]:
     direction = graph.get("direction", "LR")
 
     if not nodes:
-        return _result(positions={}, broken_edges=[], n_nodes=0, n_edges=0, n_layers=0, crossings=0)
+        return _result({}, [], 0, 0, 0, 0)
     if len(nodes) == 1:
-        return _result(positions={nodes[0]["id"]: (0, 0)}, broken_edges=[], n_nodes=1, n_edges=0, n_layers=1, crossings=0)
+        return _result({nodes[0]["id"]: (0, 0)}, [], 1, 0, 1, 0)
 
     ids = [n["id"] for n in nodes]
     is_fb = {n["id"]: bool(n.get("is_feedback_top")) for n in nodes}
 
     dag_edges, broken = _break_cycles(ids, edges, is_fb)
     layers = _assign_layers(ids, dag_edges)
-    # Phases 3+4 are placeholders; use naive grid for now so tests can assert ordering.
-    positions = _naive_coords(layers, spacing, direction)
+    layers, proper_edges = _insert_dummies(layers, dag_edges)
+    crossings_before = _count_crossings(layers, proper_edges)
+    layers = _reduce_crossings(layers, proper_edges)
+    crossings_after = _count_crossings(layers, proper_edges)
+    positions = _naive_coords(_strip_dummies(layers), spacing, direction)
 
     return _result(
-        positions=positions,
-        broken_edges=broken,
-        n_nodes=len(nodes),
-        n_edges=len(edges),
-        n_layers=len(layers),
-        crossings=0,
+        positions, broken, len(nodes), len(edges), len(layers),
+        crossings_before, crossings_after,
     )
 
 
-def _result(
-    positions: dict[str, tuple[int, int]],
-    broken_edges: list[dict],
-    n_nodes: int,
-    n_edges: int,
-    n_layers: int,
-    crossings: int,
-) -> dict[str, Any]:
+def _result(positions, broken_edges, n_nodes, n_edges, n_layers, c_before, c_after=None):
+    if c_after is None:
+        c_after = c_before
     return {
         "positions": positions,
         "broken_edges": broken_edges,
@@ -56,9 +50,86 @@ def _result(
             "nodes": n_nodes,
             "edges": n_edges,
             "layers": n_layers,
-            "crossings_before": crossings,
+            "crossings_before": c_before,
+            "crossings_after": c_after,
         },
     }
+
+
+DUMMY_PREFIX = "__dummy__"
+
+
+def _insert_dummies(layers, edges):
+    """Subdivide every edge that spans > 1 layer with dummy nodes."""
+    layer_of = {nid: i for i, row in enumerate(layers) for nid in row}
+    new_layers = [list(row) for row in layers]
+    new_edges: list[dict] = []
+    dummy_counter = 0
+    for e in edges:
+        a, b = e["from"], e["to"]
+        ra, rb = layer_of[a], layer_of[b]
+        if rb - ra == 1:
+            new_edges.append({"from": a, "to": b})
+            continue
+        prev = a
+        for r in range(ra + 1, rb):
+            d = f"{DUMMY_PREFIX}{dummy_counter}"
+            dummy_counter += 1
+            new_layers[r].append(d)
+            new_edges.append({"from": prev, "to": d})
+            prev = d
+        new_edges.append({"from": prev, "to": b})
+    return new_layers, new_edges
+
+
+def _strip_dummies(layers):
+    return [[n for n in row if not n.startswith(DUMMY_PREFIX)] for row in layers]
+
+
+def _count_crossings(layers, edges):
+    """Count edge crossings between adjacent layer pairs by position index."""
+    total = 0
+    for i in range(len(layers) - 1):
+        top = {n: j for j, n in enumerate(layers[i])}
+        bot = {n: j for j, n in enumerate(layers[i + 1])}
+        es = [(top[e["from"]], bot[e["to"]])
+              for e in edges if e["from"] in top and e["to"] in bot]
+        for a in range(len(es)):
+            for b in range(a + 1, len(es)):
+                (u1, v1), (u2, v2) = es[a], es[b]
+                if (u1 < u2 and v1 > v2) or (u1 > u2 and v1 < v2):
+                    total += 1
+    return total
+
+
+def _reduce_crossings(layers, edges, sweeps: int = 24):
+    """Barycentric sweep: 12 down-passes + 12 up-passes, keep the best."""
+    best = [list(r) for r in layers]
+    best_cost = _count_crossings(best, edges)
+    current = [list(r) for r in layers]
+
+    def barycenter(nid, neighbour_layer_idx, current_layers):
+        order = {n: j for j, n in enumerate(current_layers[neighbour_layer_idx])}
+        neighbours = [order[e["from"]] for e in edges
+                      if e["to"] == nid and e["from"] in order]
+        neighbours += [order[e["to"]] for e in edges
+                       if e["from"] == nid and e["to"] in order]
+        return sum(neighbours) / len(neighbours) if neighbours else 0.0
+
+    for sweep in range(sweeps):
+        if sweep % 2 == 0:
+            # Down pass: each layer ordered by barycenter of previous layer.
+            for i in range(1, len(current)):
+                current[i].sort(key=lambda n: barycenter(n, i - 1, current))
+        else:
+            # Up pass.
+            for i in range(len(current) - 2, -1, -1):
+                current[i].sort(key=lambda n: barycenter(n, i + 1, current))
+        cost = _count_crossings(current, edges)
+        if cost < best_cost:
+            best = [list(r) for r in current]
+            best_cost = cost
+    return best
 
 
 def _break_cycles(

@@ -83,5 +83,29 @@ class CycleBreakTest(unittest.TestCase):
         self.assertEqual(be["to"], "comp")
 
 
+class CrossingReductionTest(unittest.TestCase):
+    def test_clean_diamond_has_zero_crossings(self):
+        # a -> {b, c} -> d is crossing-free by construction.
+        result = td_layout.layout({
+            "nodes": [{"id": n, "is_feedback_top": False} for n in "abcd"],
+            "edges": [{"from": "a", "to": "b"},
+                      {"from": "a", "to": "c"},
+                      {"from": "b", "to": "d"},
+                      {"from": "c", "to": "d"}],
+        })
+        self.assertEqual(result["stats"]["crossings_after"], 0)
+
+    def test_bipartite_crossing_is_reduced(self):
+        # Two "left" nodes, two "right" nodes, wires x: a->d, b->c.
+        # Natural ordering [a,b][c,d] has 1 crossing; barycenter should flip to [a,b][d,c] -> 0.
+        result = td_layout.layout({
+            "nodes": [{"id": n, "is_feedback_top": False} for n in "abcd"],
+            "edges": [{"from": "a", "to": "d"},
+                      {"from": "b", "to": "c"}],
+        })
+        self.assertEqual(result["stats"]["crossings_after"], 0)
+        self.assertGreaterEqual(result["stats"]["crossings_before"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
