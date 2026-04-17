@@ -28,7 +28,7 @@ Examples:
 - Windows: `/plugin install C:/Users/you/Touch`
 - macOS:   `/plugin install /Users/you/Touch`
 
-Claude Code reads `.claude-plugin/plugin.json` and `.mcp.json` and registers the `touch` MCP server. You should now see nine `td_*` tools available to Claude.
+Claude Code reads `.claude-plugin/plugin.json` and `.mcp.json` and registers the `touch` MCP server. You should now see ten `td_*` tools available to Claude.
 
 ## 3. Get the `.tox`
 
@@ -85,7 +85,7 @@ With TD running and the `.tox` loaded:
 npm run smoke
 ```
 
-This exercises seven of the nine tools against your live TD. If all return JSON, you're done.
+This exercises eight of the ten tools against your live TD. If all return JSON, you're done.
 
 For a deeper check, run the manual protocol in [`tests/manual.md`](tests/manual.md) — it covers token auth, Host-header rejection, and token rotation.
 
