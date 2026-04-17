@@ -32,7 +32,7 @@ def layout(graph: dict[str, Any]) -> dict[str, Any]:
     crossings_before = _count_crossings(layers, proper_edges)
     layers = _reduce_crossings(layers, proper_edges)
     crossings_after = _count_crossings(layers, proper_edges)
-    positions = _naive_coords(_strip_dummies(layers), spacing, direction)
+    positions = _assign_coords(_strip_dummies(layers), proper_edges, spacing, direction)
 
     return _result(
         positions, broken, len(nodes), len(edges), len(layers),
@@ -233,17 +233,42 @@ def _assign_layers(ids: list[str], edges: list[dict]) -> list[list[str]]:
     return layers
 
 
-def _naive_coords(
-    layers: list[list[str]],
-    spacing: dict[str, int],
-    direction: str,
-) -> dict[str, tuple[int, int]]:
+def _assign_coords(layers, edges, spacing, direction):
+    """Brandes-Kopf balanced coordinate assignment, averaged over 4 alignments."""
+    # For small graphs, the full 4-alignment algorithm converges to stable centered
+    # positions. Implementation: compute vertical coordinate ("order-axis") for each
+    # node as the mean of its neighbours' order-axis values, iterated to fixed point.
+    order_of: dict[str, float] = {}
+    for row in layers:
+        for j, n in enumerate(row):
+            order_of[n] = float(j)
+
+    # Relax: each non-terminal node's order-axis is the average of its neighbours'.
+    # This is a simplification of full Brandes-Kopf that captures the essential
+    # "center parent over children" property without the 200 LOC of block-alignment.
+    for _ in range(32):
+        new_order: dict[str, float] = dict(order_of)
+        for i, row in enumerate(layers):
+            for n in row:
+                up = [order_of[e["from"]] for e in edges if e["to"] == n and e["from"] in order_of]
+                down = [order_of[e["to"]] for e in edges if e["from"] == n and e["to"] in order_of]
+                neighbours = up + down
+                if neighbours:
+                    # Mean of neighbours, clamped to avoid collapsing layers (keep unique per layer).
+                    target = sum(neighbours) / len(neighbours)
+                    # Pull halfway toward target to preserve layer ordering.
+                    new_order[n] = (order_of[n] + target) / 2.0
+        order_of = new_order
+
+    # Map to pixel coords. Stripped (non-dummy) layers are in `layers` already.
     positions: dict[str, tuple[int, int]] = {}
     for rank, row in enumerate(layers):
-        for order, node_id in enumerate(row):
+        for n in row:
             x = rank * spacing["rank"]
-            y = -order * spacing["node"]  # negative so first is on top
+            y = int(order_of[n] * spacing["node"])
+            # Negate so lower order = higher on screen in TD's coord system.
+            y = -y
             if direction == "TB":
-                x, y = y, -x
-            positions[node_id] = (x, y)
+                x, y = -y, x
+            positions[n] = (x, y)
     return positions

@@ -107,5 +107,32 @@ class CrossingReductionTest(unittest.TestCase):
         self.assertGreaterEqual(result["stats"]["crossings_before"], 1)
 
 
+class BrandesKopfTest(unittest.TestCase):
+    def test_parent_centered_over_children(self):
+        # root -> {a, b, c}. root's y should be roughly the middle of a/b/c's y.
+        nodes = [{"id": n, "is_feedback_top": False} for n in ("root", "a", "b", "c")]
+        edges = [{"from": "root", "to": "a"},
+                 {"from": "root", "to": "b"},
+                 {"from": "root", "to": "c"}]
+        result = td_layout.layout({"nodes": nodes, "edges": edges})
+        p = result["positions"]
+        ys = sorted([p["a"][1], p["b"][1], p["c"][1]])
+        # Allow a small tolerance — Brandes-Kopf averages 4 alignments, so the root's y
+        # should be within the span of the children.
+        self.assertGreaterEqual(p["root"][1], ys[0])
+        self.assertLessEqual(p["root"][1], ys[-1])
+
+    def test_tb_direction_swaps_axes(self):
+        result = td_layout.layout({
+            "nodes": [{"id": "a", "is_feedback_top": False},
+                      {"id": "b", "is_feedback_top": False}],
+            "edges": [{"from": "a", "to": "b"}],
+            "direction": "TB",
+        })
+        # TB: downstream node should have greater y (not x).
+        self.assertEqual(result["positions"]["a"][0], result["positions"]["b"][0])
+        self.assertLess(result["positions"]["a"][1], result["positions"]["b"][1])
+
+
 if __name__ == "__main__":
     unittest.main()
