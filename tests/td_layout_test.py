@@ -25,5 +25,30 @@ class TrivialTest(unittest.TestCase):
         self.assertEqual(result["stats"]["layers"], 1)
 
 
+class LayerAssignmentTest(unittest.TestCase):
+    def test_two_node_chain(self):
+        result = td_layout.layout({
+            "nodes": [{"id": "a", "is_feedback_top": False},
+                      {"id": "b", "is_feedback_top": False}],
+            "edges": [{"from": "a", "to": "b"}],
+        })
+        # With direction LR and default rank spacing 150, a -> b means b is one rank right.
+        self.assertEqual(result["stats"]["layers"], 2)
+        self.assertLess(result["positions"]["a"][0], result["positions"]["b"][0])
+
+    def test_diamond_has_b_and_c_on_same_rank(self):
+        result = td_layout.layout({
+            "nodes": [{"id": n, "is_feedback_top": False} for n in "abcd"],
+            "edges": [{"from": "a", "to": "b"},
+                      {"from": "a", "to": "c"},
+                      {"from": "b", "to": "d"},
+                      {"from": "c", "to": "d"}],
+        })
+        self.assertEqual(result["stats"]["layers"], 3)
+        self.assertEqual(result["positions"]["b"][0], result["positions"]["c"][0])
+        self.assertLess(result["positions"]["a"][0], result["positions"]["b"][0])
+        self.assertLess(result["positions"]["b"][0], result["positions"]["d"][0])
+
+
 if __name__ == "__main__":
     unittest.main()
