@@ -21108,6 +21108,13 @@ async function createTool(args) {
     headers: { "Content-Type": "application/json" }
   }));
 }
+async function layoutTool(args) {
+  return asText(await td("/layout", {
+    method: "POST",
+    body: JSON.stringify(args),
+    headers: { "Content-Type": "application/json" }
+  }));
+}
 function buildServer() {
   const server = new McpServer({ name: "touch", version: "0.1.0" });
   server.registerTool("td_execute", {
@@ -21161,6 +21168,17 @@ function buildServer() {
       inputs: external_exports.array(external_exports.string()).optional()
     }
   }, createTool);
+  server.registerTool("td_layout", {
+    title: "Organize a subnet into a clean layered layout",
+    description: "Lay out the children of a COMP (or a selection within one) as a Sugiyama DAG. Preview by default; pass apply:true to move nodes.",
+    inputSchema: {
+      path: external_exports.string().optional(),
+      selection_only: external_exports.boolean().optional(),
+      direction: external_exports.enum(["LR", "TB"]).optional(),
+      spacing: external_exports.object({ rank: external_exports.number().optional(), node: external_exports.number().optional() }).optional(),
+      apply: external_exports.boolean().optional()
+    }
+  }, layoutTool);
   return server;
 }
 async function main() {
@@ -21180,6 +21198,7 @@ export {
   errorsTool,
   executeTool,
   graphTool,
+  layoutTool,
   operatorsTool,
   paneTool,
   paramsTool,

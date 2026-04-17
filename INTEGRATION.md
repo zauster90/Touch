@@ -103,8 +103,6 @@ Claude invokes the appropriate `td_*` tool; the TS wrapper sends an HTTP request
 
 ## 7. Auto-layout: tidy your network
 
-> **Status:** v0.2 — in design. This section documents the planned `td_layout` tool.
-
 Ask Claude to organize any TD subnet into a clean left-to-right signal-flow layout. No dragging nodes by hand.
 
 ### What it does
