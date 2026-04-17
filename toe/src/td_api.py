@@ -413,6 +413,71 @@ def _create(ctx: Ctx):
     return 200, _op_info(child)
 
 
+@route("POST", "/layout")
+def _layout(ctx: Ctx):
+    import td_layout  # local import so engine errors don't brick the server on boot.
+    td = _td()
+    data = ctx.json() or {}
+    path = data.get("path")
+    if not path:
+        return 400, {"error": {"type": "BadInput", "message": "path required"}}
+    parent = td.op(path)
+    if parent is None:
+        return 404, {"error": {"type": "NotFound", "message": path}}
+
+    selection_only = bool(data.get("selection_only", False))
+    direction = data.get("direction", "LR")
+    spacing = data.get("spacing") or {}
+    apply_changes = bool(data.get("apply", False))
+
+    # Collect nodes + wires.
+    children = parent.findChildren(depth=1)
+    if selection_only:
+        children = [c for c in children if getattr(c, "selected", False)]
+    child_by_path = {c.path: c for c in children}
+
+    nodes = [
+        {"id": c.path, "is_feedback_top": getattr(c, "type", "") == "feedbackTOP"}
+        for c in children
+    ]
+    edges: list[dict] = []
+    for c in children:
+        for ic in getattr(c, "inputConnectors", []) or []:
+            for conn in getattr(ic, "connections", []) or []:
+                owner = getattr(conn, "owner", None)
+                owner_path = getattr(owner, "path", None) if owner is not None else None
+                if owner_path and owner_path in child_by_path:
+                    edges.append({"from": owner_path, "to": c.path})
+
+    result = td_layout.layout({
+        "nodes": nodes, "edges": edges,
+        "direction": direction, "spacing": spacing,
+    })
+
+    if "error" in result:
+        return 400, result
+
+    plan = []
+    for cp, (x, y) in result["positions"].items():
+        child = child_by_path.get(cp)
+        from_xy = (getattr(child, "nodeX", 0), getattr(child, "nodeY", 0)) if child else (0, 0)
+        plan.append({"path": cp, "from": list(from_xy), "to": [int(x), int(y)]})
+
+    if apply_changes:
+        for cp, (x, y) in result["positions"].items():
+            c = child_by_path.get(cp)
+            if c is not None and hasattr(c, "nodeX"):
+                c.nodeX, c.nodeY = int(x), int(y)
+
+    return 200, {
+        "mode": "applied" if apply_changes else "preview",
+        "target": path,
+        "plan": plan,
+        "broken_edges": result["broken_edges"],
+        "stats": result["stats"],
+    }
+
+
 @route("GET", "/graph")
 def _graph(ctx: Ctx):
     td = _td()
