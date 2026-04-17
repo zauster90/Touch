@@ -40,7 +40,15 @@ def layout(graph: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _result(positions, broken_edges, n_nodes, n_edges, n_layers, c_before, c_after=None):
+def _result(
+    positions: dict[str, tuple[int, int]],
+    broken_edges: list[dict],
+    n_nodes: int,
+    n_edges: int,
+    n_layers: int,
+    c_before: int,
+    c_after: int | None = None,
+) -> dict[str, Any]:
     if c_after is None:
         c_after = c_before
     return {
@@ -104,27 +112,38 @@ def _count_crossings(layers, edges):
 
 def _reduce_crossings(layers, edges, sweeps: int = 24):
     """Barycentric sweep: 12 down-passes + 12 up-passes, keep the best."""
+    in_neighbours: dict[str, list[str]] = {}
+    out_neighbours: dict[str, list[str]] = {}
+    for row in layers:
+        for n in row:
+            in_neighbours.setdefault(n, [])
+            out_neighbours.setdefault(n, [])
+    for e in edges:
+        out_neighbours.setdefault(e["from"], []).append(e["to"])
+        in_neighbours.setdefault(e["to"], []).append(e["from"])
+
     best = [list(r) for r in layers]
     best_cost = _count_crossings(best, edges)
     current = [list(r) for r in layers]
 
-    def barycenter(nid, neighbour_layer_idx, current_layers):
-        order = {n: j for j, n in enumerate(current_layers[neighbour_layer_idx])}
-        neighbours = [order[e["from"]] for e in edges
-                      if e["to"] == nid and e["from"] in order]
-        neighbours += [order[e["to"]] for e in edges
-                       if e["from"] == nid and e["to"] in order]
-        return sum(neighbours) / len(neighbours) if neighbours else 0.0
+    def barycenter(nid: str, i: int, use_in: bool) -> float:
+        ref_layer = current[i - 1] if use_in else current[i + 1]
+        order = {n: j for j, n in enumerate(ref_layer)}
+        nbrs = in_neighbours[nid] if use_in else out_neighbours[nid]
+        indices = [order[m] for m in nbrs if m in order]
+        if indices:
+            return sum(indices) / len(indices)
+        return float(current[i].index(nid))  # no neighbours -> stay put
 
     for sweep in range(sweeps):
         if sweep % 2 == 0:
-            # Down pass: each layer ordered by barycenter of previous layer.
+            # Down pass: each layer ordered by barycenter of predecessors.
             for i in range(1, len(current)):
-                current[i].sort(key=lambda n: barycenter(n, i - 1, current))
+                current[i].sort(key=lambda n, i=i: barycenter(n, i, True))
         else:
-            # Up pass.
+            # Up pass: each layer ordered by barycenter of successors.
             for i in range(len(current) - 2, -1, -1):
-                current[i].sort(key=lambda n: barycenter(n, i + 1, current))
+                current[i].sort(key=lambda n, i=i: barycenter(n, i, False))
         cost = _count_crossings(current, edges)
         if cost < best_cost:
             best = [list(r) for r in current]
