@@ -1,5 +1,6 @@
 """Unit tests for the pure-Python Sugiyama layout engine.
 Runs with no TouchDesigner dependency."""
+import random
 import sys
 import unittest
 from pathlib import Path
@@ -97,11 +98,15 @@ class CrossingReductionTest(unittest.TestCase):
 
     def test_bipartite_crossing_is_reduced(self):
         # Two "left" nodes, two "right" nodes, wires x: a->d, b->c.
+        # A shared sink `e` keeps the graph weakly-connected so the component
+        # splitter keeps a/b/c/d together and the crossing is observable.
         # Natural ordering [a,b][c,d] has 1 crossing; barycenter should flip to [a,b][d,c] -> 0.
         result = td_layout.layout({
-            "nodes": [{"id": n, "is_feedback_top": False} for n in "abcd"],
+            "nodes": [{"id": n, "is_feedback_top": False} for n in "abcde"],
             "edges": [{"from": "a", "to": "d"},
-                      {"from": "b", "to": "c"}],
+                      {"from": "b", "to": "c"},
+                      {"from": "c", "to": "e"},
+                      {"from": "d", "to": "e"}],
         })
         self.assertEqual(result["stats"]["crossings_after"], 0)
         self.assertGreaterEqual(result["stats"]["crossings_before"], 1)
@@ -132,6 +137,45 @@ class BrandesKopfTest(unittest.TestCase):
         # TB: downstream node should have greater y (not x).
         self.assertEqual(result["positions"]["a"][0], result["positions"]["b"][0])
         self.assertLess(result["positions"]["a"][1], result["positions"]["b"][1])
+
+
+class IntegrationTest(unittest.TestCase):
+    def test_disconnected_components_dont_overlap(self):
+        # Two disjoint chains: a->b and c->d.
+        result = td_layout.layout({
+            "nodes": [{"id": n, "is_feedback_top": False} for n in "abcd"],
+            "edges": [{"from": "a", "to": "b"}, {"from": "c", "to": "d"}],
+        })
+        positions = result["positions"]
+        # All four positioned.
+        self.assertEqual(len(positions), 4)
+        # No two nodes share a position.
+        self.assertEqual(len({tuple(p) for p in positions.values()}), 4)
+
+    def test_graph_too_large_returns_error(self):
+        nodes = [{"id": f"n{i}", "is_feedback_top": False} for i in range(501)]
+        result = td_layout.layout({"nodes": nodes, "edges": []})
+        self.assertIn("error", result)
+        self.assertEqual(result["error"]["type"], "TooLarge")
+        self.assertEqual(result["error"]["node_count"], 501)
+
+    def test_random_20_node_dag_crossings_non_increasing(self):
+        rng = random.Random(42)
+        ids = [f"n{i}" for i in range(20)]
+        # Build a random layered DAG so it has crossings to reduce.
+        edges: list[dict] = []
+        for i in range(19):
+            for _ in range(rng.randint(1, 2)):
+                j = rng.randint(i + 1, 19)
+                edges.append({"from": ids[i], "to": ids[j]})
+        result = td_layout.layout({
+            "nodes": [{"id": i, "is_feedback_top": False} for i in ids],
+            "edges": edges,
+        })
+        self.assertLessEqual(
+            result["stats"]["crossings_after"],
+            result["stats"]["crossings_before"],
+        )
 
 
 if __name__ == "__main__":
