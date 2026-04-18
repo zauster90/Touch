@@ -12,6 +12,7 @@ import hmac
 import io
 import json
 import os
+import queue
 import secrets
 import sys
 import tempfile
@@ -91,6 +92,51 @@ def get_log() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Main-thread marshaling
+# ---------------------------------------------------------------------------
+# TD's Python API (op(), ui.*, par access) is only safe on the main cook
+# thread. The HTTP server runs handlers on worker threads, so we queue work
+# here and drain it from an Execute DAT's onFrameStart callback.
+
+_main_q: queue.Queue = queue.Queue()
+
+
+def run_on_main(fn: Callable[[], Any], timeout: float = 5.0) -> Any:
+    ev = threading.Event()
+    box: list = [None, None]  # [result, exception]
+
+    def wrapped():
+        try:
+            box[0] = fn()
+        except BaseException as e:  # noqa: BLE001
+            box[1] = e
+        finally:
+            ev.set()
+
+    _main_q.put(wrapped)
+    if not ev.wait(timeout=timeout):
+        raise TimeoutError(f"main-thread call timed out after {timeout}s")
+    if box[1] is not None:
+        raise box[1]
+    return box[0]
+
+
+def drain_main_queue() -> int:
+    """Call from TD main thread every frame. Returns tasks executed."""
+    n = 0
+    while True:
+        try:
+            fn = _main_q.get_nowait()
+        except queue.Empty:
+            return n
+        try:
+            fn()
+        except Exception:
+            log(f"main-thread task error:\n{traceback.format_exc()}")
+        n += 1
+
+
+# ---------------------------------------------------------------------------
 # Router — endpoints register via @route
 # ---------------------------------------------------------------------------
 
@@ -152,11 +198,22 @@ class TDHandler(BaseHTTPRequestHandler):
         self.end_headers()
         log(f"DENY {code} {reason} {self.path}")
 
+    # JSON serialization fallback. Runs on the HTTP worker thread — must NOT
+    # access TD OP attributes from here (TD detects cross-thread access and
+    # pops a modal that blocks the main cook thread, wedging the whole app).
+    # The endpoint is responsible for coercing any OPs to plain str/int/etc.
+    # on the main thread before returning. If an OP slips through anyway,
+    # return a safe placeholder instead of dereffing it.
+    @staticmethod
+    def _json_coerce(o):
+        # type().__name__ is always safe — no TD OP attribute access.
+        return f"<unserializable:{type(o).__name__}>"
+
     def _respond(self, status: int, body: Any, *, content_type: str = "application/json") -> None:
         if isinstance(body, (bytes, bytearray)):
             payload = bytes(body)
         else:
-            payload = json.dumps(body).encode("utf-8")
+            payload = json.dumps(body, default=self._json_coerce).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
@@ -182,7 +239,9 @@ class TDHandler(BaseHTTPRequestHandler):
 
         ctx = Ctx(self, parse_qs(parsed.query), body)
         try:
-            status, payload = endpoint(ctx)
+            # Marshal endpoint execution onto TD's main cook thread.
+            # TD Python API (op(), ui.*, par access) is not thread-safe.
+            status, payload = run_on_main(lambda: endpoint(ctx))
         except Exception as exc:  # noqa: BLE001
             log(f"ERR {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
             return self._respond(500, {"error": {"type": type(exc).__name__, "message": str(exc)}})
@@ -190,9 +249,23 @@ class TDHandler(BaseHTTPRequestHandler):
         if isinstance(payload, tuple) and len(payload) == 2 and isinstance(payload[1], (bytes, bytearray)):
             # (content_type, bytes) form — for binary responses like PNG.
             content_type, data = payload
-            return self._respond(status, data, content_type=content_type)
+            try:
+                return self._respond(status, data, content_type=content_type)
+            except Exception as exc:  # noqa: BLE001
+                log(f"ERR respond-binary {type(exc).__name__}: {exc}")
+                return self._respond(500, {"error": {"type": type(exc).__name__, "message": str(exc)}})
 
-        self._respond(status, payload)
+        # Guard the final JSON response too — if it throws (e.g. un-serializable
+        # object slipped through _json_coerce), fall back to a 500 rather than
+        # letting the exception kill the single-threaded HTTP worker.
+        try:
+            self._respond(status, payload)
+        except Exception as exc:  # noqa: BLE001
+            log(f"ERR respond-json {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+            try:
+                self._respond(500, {"error": {"type": type(exc).__name__, "message": str(exc)}})
+            except Exception:  # noqa: BLE001
+                pass
 
     def do_GET(self): self._handle("GET")
     def do_POST(self): self._handle("POST")
@@ -341,15 +414,25 @@ def _params_get(ctx: Ctx):
     o = td.op(path)
     if o is None:
         return 404, {"error": {"type": "NotFound", "message": path}}
+    # Use `o.pars()` — the canonical TD API for enumerating a node's parameters.
+    # `dir(o.par)` returns pseudo-attributes like `owner` (raw OP reference) that
+    # leak into the response and trigger TD's cross-thread safety dialog when
+    # JSON serialization tries to read `.path` from the HTTP worker thread.
+    # All OP coercion MUST happen on THIS (main) thread before returning.
     pars: dict[str, Any] = {}
     try:
-        names = [n for n in dir(o.par) if not n.startswith("_")]
+        par_list = list(o.pars())
     except Exception:  # noqa: BLE001
-        names = []
-    for name in names:
+        par_list = []
+    for par in par_list:
         try:
-            val = getattr(o.par, name)
-            pars[name] = val.eval if hasattr(val, "eval") else val
+            evaluated = par.eval()
+            # OP-typed pars (TOP/CHOP/COMP/DAT/SOP/MAT/POP) return an OP object;
+            # coerce to its .path here (on the main thread) so the HTTP thread
+            # never touches a TD OP during JSON serialization.
+            if evaluated is not None and hasattr(evaluated, "path") and hasattr(evaluated, "family"):
+                evaluated = evaluated.path
+            pars[par.name] = evaluated
         except Exception:  # noqa: BLE001
             pass
     return 200, {"path": path, "params": pars}
