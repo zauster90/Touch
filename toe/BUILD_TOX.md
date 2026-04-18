@@ -25,7 +25,16 @@ Inside `/project1/TouchAPI`:
 - Open the DAT and paste the full contents of `toe/src/td_api.py`.
 - Save. Do not hand-edit this DAT after this point — always edit `toe/src/td_api.py` in-repo and re-sync.
 
-### 3b. `td_runtime_shim` — Text DAT (runtime bridge)
+### 3b. `td_layout` — Text DAT (layout engine)
+
+- `Tab` → **Text DAT**. Rename to `td_layout`.
+- On the DAT's `Common` page, set **Language** to `Python`.
+- Open the DAT and paste the full contents of `toe/src/td_layout.py`.
+- Save. Same rule as `td_api_src`: do not hand-edit this DAT after this point — always edit `toe/src/td_layout.py` in-repo and re-sync.
+
+This DAT backs the `/layout` HTTP endpoint (and the `td_layout` MCP tool). It is pure stdlib Python and has no TD imports — but `td_api_src` calls `import td_layout`, so the DAT must be present *and* registered in `sys.modules` by the shim below. Without it the server will boot cleanly, but any `POST /layout` request returns a 500 with `ModuleNotFoundError: No module named 'td_layout'`.
+
+### 3c. `td_runtime_shim` — Text DAT (runtime bridge)
 
 - `Tab` → **Text DAT**. Rename to `td_runtime_shim`.
 - Set **Language** to `Python`.
@@ -33,16 +42,19 @@ Inside `/project1/TouchAPI`:
   ```python
   # td_runtime shim — exposes TD's globals as a module so td_api_src
   # can `import td_runtime` both inside TD and in standalone tests.
+  # Also exposes the sibling `td_layout` Text DAT as an importable
+  # module so td_api_src's `import td_layout` resolves at runtime.
   import sys, types
   m = types.ModuleType("td_runtime")
   m.op = op
   m.ops = ops
   m.ui = ui
   sys.modules["td_runtime"] = m
+  sys.modules["td_layout"] = mod('td_layout')
   ```
 - Right-click the DAT → **Run Script**. This must run once before `td_api_src` is imported; the `bootstrap` Execute DAT (below) re-runs it on project start.
 
-### 3c. `bootstrap` — Execute DAT (lifecycle)
+### 3d. `bootstrap` — Execute DAT (lifecycle)
 
 - `Tab` → **Execute DAT**. Rename to `bootstrap`.
 - On the DAT's parameters, turn on **Start** and **Exit** callbacks.
@@ -108,15 +120,16 @@ From the repo root:
 python scripts/extract_tox.py
 ```
 
-If `toeexpand` is on PATH, this dumps the DATs out of the `.tox` into a sibling folder. Open the extracted `td_api_src.py` and diff against `toe/src/td_api.py`:
+If `toeexpand` is on PATH, this dumps the DATs out of the `.tox` into a sibling folder. Diff both source DATs against the repo copies:
 
 ```bash
 diff toe/TouchAPI.tox.expand/td_api_src.py toe/src/td_api.py
+diff toe/TouchAPI.tox.expand/td_layout.py   toe/src/td_layout.py
 ```
 
-**Any drift means the `.tox` and the source disagree** — reject the `.tox`, re-paste `toe/src/td_api.py` into the `td_api_src` DAT, and resave. The `.tox` must be bit-equivalent content to the repo source.
+**Any drift means the `.tox` and the source disagree** — reject the `.tox`, re-paste the affected source into the corresponding DAT, and resave. The `.tox` must be bit-equivalent content to the repo source for both files.
 
-If `toeexpand` is not installed, the script prints manual instructions: open the `.tox` in TD, copy the `td_api_src` DAT text, diff.
+If `toeexpand` is not installed, the script prints manual instructions: open the `.tox` in TD, copy each Text DAT's text, diff.
 
 ---
 
@@ -126,4 +139,5 @@ If `toeexpand` is not installed, the script prints manual instructions: open the
 - **Status parameter never updates.** Check that the `bootstrap` Execute DAT's **Active** flag is on. If off, TD ignores all callbacks.
 - **Port 44444 already in use.** Another instance of TD (or this server) is already bound. Close the other instance, or in future versions read `parent().par.Port.eval()` and pass it to `start_server(port=...)`. For v0.1 the port is hardcoded in `td_api.py`; the `Port` parameter is informational only.
 - **`mod('td_api_src')` raises `NoneType has no attribute ...`.** The Text DAT's **Language** is not set to Python. Set it, then re-trigger `bootstrap.onStart`.
+- **`POST /layout` returns `500 ModuleNotFoundError: No module named 'td_layout'`.** The `td_layout` Text DAT is missing from the `TouchAPI` COMP, or `td_runtime_shim` wasn't updated to register it in `sys.modules`. Verify both pieces of step 3b/3c are in place, right-click `td_runtime_shim` → Run Script, then retry.
 - **Token file isn't generated.** `start_server` creates the directory and file lazily on first token read. If the process lacks write permission to `%APPDATA%\claude-td\`, move the config dir by setting the `CLAUDE_TD_CONFIG_DIR` environment variable before launching TD.
