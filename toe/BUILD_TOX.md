@@ -42,10 +42,10 @@ Inside `/project1/TouchAPI`:
   ```
 - Right-click the DAT → **Run Script**. This must run once before `td_api_src` is imported; the `bootstrap` Execute DAT (below) re-runs it on project start.
 
-### 3c. `bootstrap` — Execute DAT (lifecycle)
+### 3c. `bootstrap` — Execute DAT (lifecycle + main-thread pump)
 
 - `Tab` → **Execute DAT**. Rename to `bootstrap`.
-- On the DAT's parameters, turn on **Start** and **Exit** callbacks.
+- On the DAT's parameters, turn on **Start**, **Exit**, and **Frame Start** callbacks. The **Frame Start** toggle is required: TD's Python API (`op()`, `ui.*`, par access) is only safe on the main cook thread, but the HTTP server handles requests on worker threads. `onFrameStart` drains a queue of callables that the worker threads have marshalled back to the main thread. Without it, endpoints will raise "Invalid OP object" and TD may pop a THREAD CONFLICT dialog.
 - Replace the body with:
   ```python
   def onStart():
@@ -58,6 +58,9 @@ Inside `/project1/TouchAPI`:
           mod('td_api_src').stop_server()
       finally:
           parent().par.Status = "stopped"
+
+  def onFrameStart(frame):
+      mod('td_api_src').drain_main_queue()
   ```
   `mod('td_api_src')` accesses a Python Text DAT as a module (TD's DAT-as-module feature).
 

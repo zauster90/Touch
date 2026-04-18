@@ -12,6 +12,7 @@ import hmac
 import io
 import json
 import os
+import queue
 import secrets
 import sys
 import tempfile
@@ -88,6 +89,44 @@ def log(line: str) -> None:
 
 def get_log() -> list[str]:
     return list(_log)
+
+
+# ---------------------------------------------------------------------------
+# Main-thread marshaling
+# ---------------------------------------------------------------------------
+# TD's Python API (op(), ui.*, par access) is only safe on the main cook
+# thread. HTTPServer runs request handlers on worker threads, so endpoints
+# must hop back to the main thread. We enqueue callables on `_main_q` from
+# worker threads and drain them from the bootstrap Execute DAT's
+# `onFrameStart` callback.
+
+_main_q: "queue.Queue[tuple[Callable[[], Any], queue.Queue[tuple[bool, Any]]]]" = queue.Queue()
+
+
+def run_on_main(fn: Callable[[], Any], timeout: float = 5.0) -> Any:
+    """Queue `fn` for execution on the main cook thread and block for its result."""
+    reply: "queue.Queue[tuple[bool, Any]]" = queue.Queue(maxsize=1)
+    _main_q.put((fn, reply))
+    try:
+        ok, value = reply.get(timeout=timeout)
+    except queue.Empty as exc:
+        raise TimeoutError(f"main thread didn't drain within {timeout}s") from exc
+    if ok:
+        return value
+    raise value
+
+
+def drain_main_queue() -> None:
+    """Run all pending callables on the caller thread. Invoke once per frame."""
+    while True:
+        try:
+            fn, reply = _main_q.get_nowait()
+        except queue.Empty:
+            return
+        try:
+            reply.put((True, fn()))
+        except BaseException as exc:  # noqa: BLE001
+            reply.put((False, exc))
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +221,7 @@ class TDHandler(BaseHTTPRequestHandler):
 
         ctx = Ctx(self, parse_qs(parsed.query), body)
         try:
-            status, payload = endpoint(ctx)
+            status, payload = run_on_main(lambda: endpoint(ctx))
         except Exception as exc:  # noqa: BLE001
             log(f"ERR {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
             return self._respond(500, {"error": {"type": type(exc).__name__, "message": str(exc)}})
