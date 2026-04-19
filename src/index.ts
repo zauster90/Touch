@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * Touch — TouchDesigner MCP server.
  *
@@ -132,6 +131,9 @@ export async function layoutTool(args: {
   selection_only?: boolean;
   direction?: "LR" | "TB";
   spacing?: { rank?: number; node?: number };
+  rank_gap?: number;
+  node_gap?: number;
+  exclude?: string[];
   apply?: boolean;
 }) {
   return asText(await td("/layout", {
@@ -210,12 +212,15 @@ function buildServer(): McpServer {
 
   server.registerTool("td_layout", {
     title: "Organize a subnet into a clean layered layout",
-    description: "Lay out the children of a COMP (or a selection within one) as a Sugiyama DAG. Preview by default; pass apply:true to move nodes.",
+    description: "Lay out the children of a COMP (or a selection within one) as a Sugiyama DAG. Preview by default; pass apply:true to move nodes. By default uses actual node widths/heights from the network editor to compute column and row spacing — no overlap even when tiles have panel previews. Pass `exclude` (names or paths) to leave curated subnets untouched. Response includes `overlaps` (pairs whose bounding boxes still intersect under the proposed plan) so callers can audit before applying.",
     inputSchema: {
       path: z.string().optional(),
       selection_only: z.boolean().optional(),
       direction: z.enum(["LR", "TB"]).optional(),
       spacing: z.object({ rank: z.number().optional(), node: z.number().optional() }).optional(),
+      rank_gap: z.number().optional().describe("Pixels of empty padding between rank columns in size-aware mode (default 60)."),
+      node_gap: z.number().optional().describe("Pixels of empty padding between stacked nodes in the same layer (default 30)."),
+      exclude: z.array(z.string()).optional().describe("Child names or absolute paths to skip — these nodes keep their current positions and are not treated as layout participants."),
       apply: z.boolean().optional(),
     },
   }, layoutTool);

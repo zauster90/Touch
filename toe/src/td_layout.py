@@ -10,24 +10,57 @@ from __future__ import annotations
 from typing import Any
 
 DEFAULT_SPACING = {"rank": 150, "node": 30}
+DEFAULT_RANK_GAP = 60   # pixels of empty space between rank columns (size-aware mode)
+DEFAULT_NODE_GAP = 30   # pixels of empty space between stacked nodes (size-aware mode)
+FALLBACK_NODE_W = 150   # assumed width for a node missing from `sizes`
+FALLBACK_NODE_H = 100   # assumed height for a node missing from `sizes`
 RELAX_ITERS = 32       # empirically sufficient for graphs <= ~50 nodes
 PULL_FACTOR = 0.5      # under-relaxation factor; lower = slower but steadier
 MAX_NODES = 500
 
 
 def layout(graph: dict[str, Any]) -> dict[str, Any]:
+    """Compute positions for a layered DAG.
+
+    Input graph dict keys:
+      - nodes: list of {"id": str, "is_feedback_top": bool?}
+      - edges: list of {"from": id, "to": id}
+      - direction: "LR" or "TB"  (default "LR")
+      - sizes: dict[id, (width, height)] for node-size-aware placement (OPTIONAL).
+          When provided, rank column widths and row heights come from the actual
+          node dimensions plus `rank_gap`/`node_gap` padding. When omitted, falls
+          back to fixed-step placement using `spacing["rank"]` and `spacing["node"]`.
+      - spacing: {"rank": int, "node": int} fixed-step override (legacy; takes
+          priority over size-aware mode when both `sizes` and explicit spacing
+          are provided).
+      - rank_gap: int, pixels of padding between ranks in size-aware mode.
+      - node_gap: int, pixels of padding between rows in size-aware mode.
+
+    Output dict keys:
+      - positions: dict[id, (x, y)]
+      - broken_edges: list of edges removed to break cycles
+      - overlaps: list of {"a": id, "b": id, "rect_a": [l,b,r,t], "rect_b": ...}
+          for any pair of nodes whose final bounding boxes intersect. Only
+          populated when `sizes` is provided (size-aware mode); empty otherwise.
+      - stats: counts (nodes, edges, layers, crossings_before, crossings_after)
+    """
     nodes = graph.get("nodes", []) or []
     edges = graph.get("edges", []) or []
-    spacing = {**DEFAULT_SPACING, **(graph.get("spacing") or {})}
+    explicit_spacing = graph.get("spacing") or {}
+    spacing = {**DEFAULT_SPACING, **explicit_spacing}
     direction = graph.get("direction", "LR")
+    sizes = graph.get("sizes") or {}
+    rank_gap = int(graph.get("rank_gap", DEFAULT_RANK_GAP))
+    node_gap = int(graph.get("node_gap", DEFAULT_NODE_GAP))
 
     if len(nodes) > MAX_NODES:
         return {"error": {"type": "TooLarge", "node_count": len(nodes),
                           "max": MAX_NODES}}
 
     if not nodes:
-        return _result({}, [], 0, 0, 0, 0)
+        return _result({}, [], 0, 0, 0, 0, overlaps=[])
 
+    size_aware = bool(sizes) and not ("rank" in explicit_spacing or "node" in explicit_spacing)
     components = _split_components(nodes, edges)
     merged_positions: dict[str, tuple[int, int]] = {}
     merged_broken: list[dict] = []
@@ -37,7 +70,11 @@ def layout(graph: dict[str, Any]) -> dict[str, Any]:
     y_offset = 0
 
     for comp_nodes, comp_edges in components:
-        sub = _layout_single(comp_nodes, comp_edges, spacing, direction)
+        sub = _layout_single(
+            comp_nodes, comp_edges, spacing, direction,
+            sizes=sizes if size_aware else None,
+            rank_gap=rank_gap, node_gap=node_gap,
+        )
         if "error" in sub:
             return sub
         shifted = _shift_positions(sub["positions"], y_offset, direction)
@@ -46,18 +83,31 @@ def layout(graph: dict[str, Any]) -> dict[str, Any]:
         total_crossings_before += sub["stats"]["crossings_before"]
         total_crossings_after += sub["stats"]["crossings_after"]
         total_layers = max(total_layers, sub["stats"]["layers"])
-        # Advance the offset past the bottom of this component.
+        # Advance the offset past the bottom of this component — use a stacking
+        # step that accommodates size-aware mode (max node height in component).
         if shifted:
             axis = 1 if direction == "LR" else 0
             lowest = min(p[axis] for p in shifted.values())
-            y_offset = lowest - 2 * spacing["node"]
+            if size_aware:
+                comp_max_h = max(
+                    (sizes.get(n["id"], (FALLBACK_NODE_W, FALLBACK_NODE_H))[1]
+                     for n in comp_nodes),
+                    default=FALLBACK_NODE_H,
+                )
+                y_offset = lowest - (comp_max_h + 2 * node_gap)
+            else:
+                y_offset = lowest - 2 * spacing["node"]
+
+    overlaps = _detect_overlaps(merged_positions, sizes) if size_aware else []
 
     return _result(merged_positions, merged_broken,
                    len(nodes), len(edges), total_layers,
-                   total_crossings_before, total_crossings_after)
+                   total_crossings_before, total_crossings_after,
+                   overlaps=overlaps)
 
 
-def _layout_single(nodes, edges, spacing, direction):
+def _layout_single(nodes, edges, spacing, direction,
+                   sizes=None, rank_gap=DEFAULT_RANK_GAP, node_gap=DEFAULT_NODE_GAP):
     ids = [n["id"] for n in nodes]
     if len(ids) == 1:
         return _result({ids[0]: (0, 0)}, [], 1, 0, 1, 0)
@@ -68,7 +118,10 @@ def _layout_single(nodes, edges, spacing, direction):
     c_before = _count_crossings(layers, proper_edges)
     layers = _reduce_crossings(layers, proper_edges)
     c_after = _count_crossings(layers, proper_edges)
-    positions = _assign_coords(_strip_dummies(layers), proper_edges, spacing, direction)
+    positions = _assign_coords(
+        _strip_dummies(layers), proper_edges, spacing, direction,
+        sizes=sizes, rank_gap=rank_gap, node_gap=node_gap,
+    )
     return _result(positions, broken, len(nodes), len(edges), len(layers), c_before, c_after)
 
 
@@ -118,12 +171,15 @@ def _result(
     n_layers: int,
     c_before: int,
     c_after: int | None = None,
+    *,
+    overlaps: list[dict] | None = None,
 ) -> dict[str, Any]:
     if c_after is None:
         c_after = c_before
     return {
         "positions": positions,
         "broken_edges": broken_edges,
+        "overlaps": overlaps or [],
         "stats": {
             "nodes": n_nodes,
             "edges": n_edges,
@@ -132,6 +188,33 @@ def _result(
             "crossings_after": c_after,
         },
     }
+
+
+def _detect_overlaps(
+    positions: dict[str, tuple[int, int]],
+    sizes: dict[str, tuple[int, int]],
+) -> list[dict]:
+    """Report any pair of nodes whose bounding boxes intersect under the final plan.
+
+    TD's `nodeX`, `nodeY` convention: (x, y) is the top-left of the node tile;
+    width extends +x, height extends +y DOWN (which is -y in TD's visual coords,
+    since layout returns y values where higher = higher on screen). Rect axes
+    are [left, bottom, right, top] with bottom < top (we negate height).
+    """
+    rects: list[tuple[str, float, float, float, float]] = []
+    for nid, (x, y) in positions.items():
+        w, h = sizes.get(nid, (FALLBACK_NODE_W, FALLBACK_NODE_H))
+        rects.append((nid, x, y - h, x + w, y))
+    overlaps: list[dict] = []
+    for i, (a, al, ab, ar, at) in enumerate(rects):
+        for b, bl, bb, br, bt in rects[i + 1:]:
+            if not (ar <= bl or br <= al or at <= bb or bt <= ab):
+                overlaps.append({
+                    "a": a, "b": b,
+                    "rect_a": [al, ab, ar, at],
+                    "rect_b": [bl, bb, br, bt],
+                })
+    return overlaps
 
 
 DUMMY_PREFIX = "__dummy__"
@@ -315,12 +398,22 @@ def _assign_coords(
     edges: list[dict],
     spacing: dict[str, int],
     direction: str,
+    *,
+    sizes: dict[str, tuple[int, int]] | None = None,
+    rank_gap: int = DEFAULT_RANK_GAP,
+    node_gap: int = DEFAULT_NODE_GAP,
 ) -> dict[str, tuple[int, int]]:
     """Iterated-mean relaxation as a pragmatic stand-in for full Brandes-Köpf.
 
-    Each node is pulled toward the mean of its neighbours' order-axis values,
-    with a post-step spread pass that enforces a minimum gap of 1.0 to preserve
-    layer ordering.
+    Two placement modes:
+
+    - **Fixed-step** (legacy, `sizes=None`): rank step = spacing["rank"], row
+      step = spacing["node"]. Treats every node as a point and relies on the
+      caller to pick spacings that accommodate their visual tiles.
+    - **Size-aware** (`sizes` provided): each rank's X position is cumulative
+      from the max node width in each preceding rank plus `rank_gap`. Row step
+      is the max node height across all layers plus `node_gap`. Nodes larger
+      than neighbours get room; nodes smaller stay tight.
     """
     order_of: dict[str, float] = {}
     for row in layers:
@@ -360,12 +453,35 @@ def _assign_coords(
                     new_order[n] = prev_order + 1.0
         order_of = new_order
 
-    # Map to pixel coords. Stripped (non-dummy) layers are in `layers` already.
+    # Build rank X offsets + uniform row step.
     positions: dict[str, tuple[int, int]] = {}
+    if sizes:
+        # Size-aware mode: x is cumulative by actual node widths; y step is
+        # max node height across all layers so rows never overlap regardless
+        # of which layer a tall node lives in.
+        rank_widths = [
+            max((sizes.get(n, (FALLBACK_NODE_W, FALLBACK_NODE_H))[0] for n in row),
+                default=FALLBACK_NODE_W)
+            for row in layers
+        ]
+        rank_x: list[int] = []
+        cursor = 0
+        for w in rank_widths:
+            rank_x.append(cursor)
+            cursor += w + rank_gap
+        row_step = max(
+            (sizes.get(n, (FALLBACK_NODE_W, FALLBACK_NODE_H))[1]
+             for row in layers for n in row),
+            default=FALLBACK_NODE_H,
+        ) + node_gap
+    else:
+        rank_x = [rank * int(spacing["rank"]) for rank in range(len(layers))]
+        row_step = int(spacing["node"])
+
     for rank, row in enumerate(layers):
         for n in row:
-            x = rank * spacing["rank"]
-            y = int(order_of[n] * spacing["node"])
+            x = rank_x[rank]
+            y = int(order_of[n] * row_step)
             # Negate so lower order = higher on screen in TD's coord system.
             y = -y
             if direction == "TB":

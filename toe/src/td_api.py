@@ -512,17 +512,35 @@ def _layout(ctx: Ctx):
     direction = data.get("direction", "LR")
     spacing = data.get("spacing") or {}
     apply_changes = bool(data.get("apply", False))
+    rank_gap = data.get("rank_gap")
+    node_gap = data.get("node_gap")
+    # exclude: list of child names OR full paths to omit from layout. Curated
+    # subnets (plugins, vendor COMPs) that the caller doesn't want the layout
+    # engine to reposition OR link to via edges.
+    exclude_raw = data.get("exclude") or []
+    exclude_names = {e for e in exclude_raw if isinstance(e, str)}
 
-    # Collect nodes + wires.
-    children = parent.findChildren(depth=1)
+    # Collect nodes + wires, filtering out excluded children before building
+    # either node list or edge list — excluded ops keep their current position.
+    children_all = parent.findChildren(depth=1)
     if selection_only:
-        children = [c for c in children if getattr(c, "selected", False)]
+        children_all = [c for c in children_all if getattr(c, "selected", False)]
+    def _is_excluded(c):
+        return c.name in exclude_names or c.path in exclude_names
+    children = [c for c in children_all if not _is_excluded(c)]
+    excluded = [c.path for c in children_all if _is_excluded(c)]
     child_by_path = {c.path: c for c in children}
 
     nodes = [
         {"id": c.path, "is_feedback_top": getattr(c, "type", "") == "feedbackTOP"}
         for c in children
     ]
+    # Size map for size-aware placement — TD's node-editor dimensions in pixels.
+    sizes = {
+        c.path: (int(getattr(c, "nodeWidth", 0) or 0),
+                 int(getattr(c, "nodeHeight", 0) or 0))
+        for c in children
+    }
     edges: list[dict] = []
     for c in children:
         for ic in getattr(c, "inputConnectors", []) or []:
@@ -532,10 +550,15 @@ def _layout(ctx: Ctx):
                 if owner_path and owner_path in child_by_path:
                     edges.append({"from": owner_path, "to": c.path})
 
-    result = td_layout.layout({
-        "nodes": nodes, "edges": edges,
+    layout_input: dict = {
+        "nodes": nodes, "edges": edges, "sizes": sizes,
         "direction": direction, "spacing": spacing,
-    })
+    }
+    if rank_gap is not None:
+        layout_input["rank_gap"] = int(rank_gap)
+    if node_gap is not None:
+        layout_input["node_gap"] = int(node_gap)
+    result = td_layout.layout(layout_input)
 
     if "error" in result:
         return 400, result
@@ -557,6 +580,8 @@ def _layout(ctx: Ctx):
         "target": path,
         "plan": plan,
         "broken_edges": result["broken_edges"],
+        "overlaps": result.get("overlaps", []),
+        "excluded": excluded,
         "stats": result["stats"],
     }
 

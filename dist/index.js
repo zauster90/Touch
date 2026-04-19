@@ -21169,12 +21169,15 @@ function buildServer() {
   }, createTool);
   server.registerTool("td_layout", {
     title: "Organize a subnet into a clean layered layout",
-    description: "Lay out the children of a COMP (or a selection within one) as a Sugiyama DAG. Preview by default; pass apply:true to move nodes.",
+    description: "Lay out the children of a COMP (or a selection within one) as a Sugiyama DAG. Preview by default; pass apply:true to move nodes. By default uses actual node widths/heights from the network editor to compute column and row spacing \u2014 no overlap even when tiles have panel previews. Pass `exclude` (names or paths) to leave curated subnets untouched. Response includes `overlaps` (pairs whose bounding boxes still intersect under the proposed plan) so callers can audit before applying.",
     inputSchema: {
       path: external_exports.string().optional(),
       selection_only: external_exports.boolean().optional(),
       direction: external_exports.enum(["LR", "TB"]).optional(),
       spacing: external_exports.object({ rank: external_exports.number().optional(), node: external_exports.number().optional() }).optional(),
+      rank_gap: external_exports.number().optional().describe("Pixels of empty padding between rank columns in size-aware mode (default 60)."),
+      node_gap: external_exports.number().optional().describe("Pixels of empty padding between stacked nodes in the same layer (default 30)."),
+      exclude: external_exports.array(external_exports.string()).optional().describe("Child names or absolute paths to skip \u2014 these nodes keep their current positions and are not treated as layout participants."),
       apply: external_exports.boolean().optional()
     }
   }, layoutTool);
