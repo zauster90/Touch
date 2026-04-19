@@ -196,24 +196,31 @@ def _reduce_crossings(layers, edges, sweeps: int = 24):
     best_cost = _count_crossings(best, edges)
     current = [list(r) for r in layers]
 
-    def barycenter(nid: str, i: int, use_in: bool) -> float:
+    # snap_idx is the layer-position snapshot taken BEFORE each sort begins.
+    # Never read current[i] from the key function — CPython's list.sort
+    # temporarily swaps the list's internal buffer with an empty one during
+    # sort (to detect mutation), so `current[i].index(nid)` inside a key
+    # function raises ValueError for every nid. Snapshot instead.
+    def barycenter(nid: str, i: int, use_in: bool, snap_idx: dict[str, int]) -> float:
         ref_layer = current[i - 1] if use_in else current[i + 1]
         order = {n: j for j, n in enumerate(ref_layer)}
         nbrs = in_neighbours[nid] if use_in else out_neighbours[nid]
         indices = [order[m] for m in nbrs if m in order]
         if indices:
             return sum(indices) / len(indices)
-        return float(current[i].index(nid))  # no neighbours -> stay put
+        return float(snap_idx.get(nid, 0))  # no neighbours -> pre-sort position
 
     for sweep in range(sweeps):
         if sweep % 2 == 0:
             # Down pass: each layer ordered by barycenter of predecessors.
             for i in range(1, len(current)):
-                current[i].sort(key=lambda n, i=i: barycenter(n, i, True))
+                snap = {n: j for j, n in enumerate(current[i])}
+                current[i].sort(key=lambda n, i=i, s=snap: barycenter(n, i, True, s))
         else:
             # Up pass: each layer ordered by barycenter of successors.
             for i in range(len(current) - 2, -1, -1):
-                current[i].sort(key=lambda n, i=i: barycenter(n, i, False))
+                snap = {n: j for j, n in enumerate(current[i])}
+                current[i].sort(key=lambda n, i=i, s=snap: barycenter(n, i, False, s))
         cost = _count_crossings(current, edges)
         if cost < best_cost:
             best = [list(r) for r in current]
