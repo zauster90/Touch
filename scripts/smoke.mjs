@@ -10,6 +10,7 @@ const checks = [
   ["td_params (read)", () => api.paramsTool({ path: "/" })],
   ["td_graph", () => api.graphTool({ path: "/", depth: 1 })],
   ["td_execute", () => api.executeTool({ code: "print('smoke ok')" })],
+  ["td_layout (preview)", () => api.layoutTool({ path: "/project1", apply: false })],
 ];
 
 let failed = 0;

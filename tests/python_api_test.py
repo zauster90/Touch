@@ -94,13 +94,27 @@ _op_registry: dict[str, _FakeOp] = {}
 
 
 def _stub_op(path=None):
+    """Test-side helper: get-or-create an op at `path`."""
     p = path or "/"
     if p not in _op_registry:
         _op_registry[p] = _FakeOp(path=p, name=p.rsplit("/", 1)[-1] or "root")
     return _op_registry[p]
 
 
-_stub.op = _stub_op
+def _td_op_lookup(path=None):
+    """Stub for `td.op(path)` — strict lookup, returns None for unknown paths.
+    Mirrors real TD behaviour so handlers' `if parent is None: return 404` fires."""
+    p = path or "/"
+    return _op_registry.get(p)
+
+
+# Pre-register paths exercised by existing tests that rely on auto-creation.
+_stub_op("/")
+_stub_op("/foo")
+_stub_op("/bar")
+_stub_op("/topA")
+
+_stub.op = _td_op_lookup
 _stub.ui = types.SimpleNamespace(panes=types.SimpleNamespace(current=types.SimpleNamespace(
     owner=_stub_op("/"), x=0, y=0, zoom=1.0)))
 _stub.ops = lambda *args: []
@@ -315,6 +329,74 @@ class ServerTest(unittest.TestCase):
     def test_screenshot_missing_path_returns_400(self):
         status, _ = self._req("/screenshot", token=self.token)
         self.assertEqual(status, 400)
+
+
+class LayoutEndpointTest(ServerTest):
+    def setUp(self):
+        # Fresh op tree per test: /project1 with three children wired a -> b -> c.
+        _op_registry.clear()
+        # Re-register paths used by other test classes so cross-class ordering
+        # doesn't accidentally turn their lookups into 404s.
+        _stub_op("/")
+        _stub_op("/foo")
+        _stub_op("/bar")
+        _stub_op("/topA")
+        project = _stub_op("/project1")
+        a = project.create("constantTOP", "a")
+        b = project.create("blurTOP", "b")
+        c = project.create("outTOP", "c")
+        # Fake wires: connect a -> b -> c via inputConnectors.
+        b.inputConnectors = [types.SimpleNamespace(
+            connections=[types.SimpleNamespace(owner=a)])]
+        c.inputConnectors = [types.SimpleNamespace(
+            connections=[types.SimpleNamespace(owner=b)])]
+        # Initial positions.
+        a.nodeX, a.nodeY = 0, 0
+        b.nodeX, b.nodeY = 0, 0
+        c.nodeX, c.nodeY = 0, 0
+
+    def test_preview_does_not_move_nodes(self):
+        status, body = self._req(
+            "/layout", token=self.token, method="POST",
+            body=json.dumps({"path": "/project1", "apply": False}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["mode"], "preview")
+        self.assertEqual(len(data["plan"]), 3)
+        # Nothing actually moved.
+        self.assertEqual(_op_registry["/project1/a"].nodeX, 0)
+        self.assertEqual(_op_registry["/project1/b"].nodeX, 0)
+
+    def test_apply_moves_nodes(self):
+        status, body = self._req(
+            "/layout", token=self.token, method="POST",
+            body=json.dumps({"path": "/project1", "apply": True}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["mode"], "applied")
+        # At least one node actually moved.
+        moved = [_op_registry[f"/project1/{n}"].nodeX for n in "abc"]
+        self.assertNotEqual(moved, [0, 0, 0])
+
+    def test_unknown_path_returns_404(self):
+        status, _ = self._req(
+            "/layout", token=self.token, method="POST",
+            body=json.dumps({"path": "/does/not/exist"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 404)
+
+    def test_requires_auth(self):
+        status, _ = self._req(
+            "/layout", method="POST",
+            body=json.dumps({"path": "/project1"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 401)
 
 
 if __name__ == "__main__":

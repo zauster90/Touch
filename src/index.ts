@@ -127,6 +127,19 @@ export async function createTool(args: {
     headers: { "Content-Type": "application/json" },
   }));
 }
+export async function layoutTool(args: {
+  path?: string;
+  selection_only?: boolean;
+  direction?: "LR" | "TB";
+  spacing?: { rank?: number; node?: number };
+  apply?: boolean;
+}) {
+  return asText(await td("/layout", {
+    method: "POST",
+    body: JSON.stringify(args),
+    headers: { "Content-Type": "application/json" },
+  }));
+}
 
 // ---------------------------------------------------------------------------
 // MCP server wiring
@@ -194,6 +207,18 @@ function buildServer(): McpServer {
       inputs: z.array(z.string()).optional(),
     },
   }, createTool);
+
+  server.registerTool("td_layout", {
+    title: "Organize a subnet into a clean layered layout",
+    description: "Lay out the children of a COMP (or a selection within one) as a Sugiyama DAG. Preview by default; pass apply:true to move nodes.",
+    inputSchema: {
+      path: z.string().optional(),
+      selection_only: z.boolean().optional(),
+      direction: z.enum(["LR", "TB"]).optional(),
+      spacing: z.object({ rank: z.number().optional(), node: z.number().optional() }).optional(),
+      apply: z.boolean().optional(),
+    },
+  }, layoutTool);
 
   return server;
 }

@@ -2,13 +2,15 @@
 
 A Claude Code plugin that exposes TouchDesigner to Claude via MCP: execute Python, query the network editor, inspect operators and parameters, capture TOP renders, and create/wire operators programmatically.
 
+**New here?** Start with the [**Integration Guide**](INTEGRATION.md) — zero-to-working in about ten minutes.
+
 ## Status
 
 v0.1 — local-only install. Requires TouchDesigner 2025+ and Node 20+. Developed and tested on Windows 11. POSIX paths are handled but unverified end-to-end.
 
 ## What it does
 
-Nine MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint hosted inside TouchDesigner:
+Ten MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint hosted inside TouchDesigner:
 
 | Tool | Description | Example prompt |
 |---|---|---|
@@ -21,6 +23,7 @@ Nine MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint hoste
 | `td_screenshot` | PNG of a TOP's current frame, returned as an inline image. | "Screenshot the `out1` render TOP." |
 | `td_graph` | Structured JSON subgraph: nodes + wires, to a given depth. | "Show me the graph under `/project1/comp1`." |
 | `td_create` | Create an operator of a given type under a parent, optionally wired to inputs. | "Add a `noiseTOP` and wire it into `render1`." |
+| `td_layout` | Organize a subnet with a Sugiyama layered-DAG layout. Preview by default. | "Tidy `/project1/comp1`." |
 
 ## Security posture
 
@@ -33,19 +36,7 @@ Nine MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint hoste
 
 ## Install
 
-1. In Claude Code, run:
-   ```
-   /plugin install C:/path/to/Touch
-   ```
-   (Use the absolute path to your local clone of this repo. There is no marketplace listing.)
-2. Open a TouchDesigner project, then drag `toe/TouchAPI.tox` into the network (typically `/project1`).
-3. Select the `TouchAPI` node and verify the `Status` custom parameter reads:
-   ```
-   READY @ 127.0.0.1:44444
-   ```
-   If it reads `stopped`, the server didn't bind — check TD's textport for Python errors.
-
-The first time you drop the .tox in, TD writes a fresh token to the config path above. The MCP server reads that same file on startup.
+See the [**Integration Guide**](INTEGRATION.md). TL;DR: `/plugin install <path>` in Claude Code, drag `toe/TouchAPI.tox` into `/project1`, check that `TouchAPI.Status` reads `READY @ 127.0.0.1:44444`.
 
 ## Usage examples
 
@@ -68,10 +59,10 @@ Clone, install, test, build:
 
 ```bash
 npm install
-npm run test        # 6 TS unit tests (client wrapper)
+npm run test        # 8 TS unit tests (client wrapper)
 python -m pytest tests/python_api_test.py   # 22 Python tests (server core)
 npm run build       # bundles src/index.ts -> dist/index.js
-npm run smoke       # exercises 7 tools against a live TD (see tests/manual.md)
+npm run smoke       # exercises 8 tools against a live TD (see tests/manual.md)
 ```
 
 Regenerating the `.tox`: see [`toe/BUILD_TOX.md`](toe/BUILD_TOX.md). After rebuilding, audit the `.tox` with:
@@ -88,7 +79,7 @@ The extractor uses `toeexpand` if available to dump DAT text, which should byte-
 Touch/
 ├── .claude-plugin/plugin.json   # plugin manifest
 ├── .mcp.json                    # MCP server declaration
-├── src/index.ts                 # MCP server + 9 tool wrappers (TS)
+├── src/index.ts                 # MCP server + 10 tool wrappers (TS)
 ├── dist/index.js                # bundled output (built)
 ├── toe/
 │   ├── TouchAPI.tox             # TD component, built from toe/src/td_api.py
