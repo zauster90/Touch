@@ -17,12 +17,13 @@ _stub = types.ModuleType("td_runtime")
 
 
 class _FakePar:
-    """Stand-in for a TD parameter. Has .val (mutable), .eval, .expr, .mode."""
-    def __init__(self, val):
+    """Stand-in for a TD parameter. Has .name, .val, .eval() (method), .expr, .mode."""
+    def __init__(self, name, val):
+        self.name = name
         self.val = val
         self.expr = ""
         self.mode = None
-    @property
+
     def eval(self):
         return self.val
 
@@ -32,7 +33,7 @@ class _FakeParGroup:
     def __init__(self, initial: dict | None = None):
         self._pars: dict[str, _FakePar] = {}
         for k, v in (initial or {}).items():
-            self._pars[k] = _FakePar(v)
+            self._pars[k] = _FakePar(k, v)
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -46,7 +47,7 @@ class _FakeParGroup:
             object.__setattr__(self, name, value)
             return
         # Setting par creates or updates a _FakePar.
-        self._pars[name] = _FakePar(value)
+        self._pars[name] = _FakePar(name, value)
 
     def __dir__(self):
         return [n for n in self._pars.keys() if not n.startswith("_")]
@@ -91,6 +92,8 @@ class _FakeOp:
         self.outputConnectors: list = [_FakeConnector(self)]
         self.nodeX = 0
         self.nodeY = 0
+        self.nodeWidth = 120
+        self.nodeHeight = 80
         # CHOP-like data
         self._chans = [_FakeChan("chan1", [0.0, 1.0, 2.0, 3.0])]
         # DAT-like data (2x2 grid)
@@ -111,6 +114,9 @@ class _FakeOp:
 
     def errors(self): return ""
     def warnings(self): return ""
+
+    def pars(self):
+        return list(self.par._pars.values())
 
     def chans(self, pattern=None):
         if pattern:
@@ -173,11 +179,24 @@ class ServerTest(unittest.TestCase):
         cls.server = td_api.start_server(host="127.0.0.1", port=0)
         cls.port = cls.server.server_address[1]
         cls.token = td_api.TokenManager().load()
-        # Give the thread a beat.
+        # Endpoints now marshal onto a "main thread" via run_on_main(); in TD
+        # that queue is drained by bootstrap.onFrameStart. Tests have no frame
+        # loop, so simulate one with a background drainer.
+        cls._draining = True
+
+        def _drain():
+            while cls._draining:
+                td_api.drain_main_queue()
+                time.sleep(0.002)
+
+        cls._drain_thread = threading.Thread(target=_drain, daemon=True)
+        cls._drain_thread.start()
+        # Give the threads a beat.
         time.sleep(0.05)
 
     @classmethod
     def tearDownClass(cls):
+        cls._draining = False
         cls.server.shutdown()
         cls.server.server_close()
         cls.tmp.cleanup()
@@ -491,6 +510,63 @@ class ServerTest(unittest.TestCase):
             body=json.dumps({"path": "/bindme", "param": "nope", "expr": "1"}),
             headers={"Content-Type": "application/json"})
         self.assertEqual(status, 404)
+
+    # --- layout ---
+    def _post(self, path, payload):
+        return self._req(path, token=self.token, method="POST",
+                         body=json.dumps(payload),
+                         headers={"Content-Type": "application/json"})
+
+    def test_layout_requires_path(self):
+        status, _ = self._post("/layout", {})
+        self.assertEqual(status, 400)
+
+    def test_layout_preview_plans_without_moving(self):
+        # Build /lay with two wired children, then preview (apply defaults False).
+        self._post("/create", {"type": "base", "parent": "/", "name": "lay"})
+        self._post("/create", {"type": "null", "parent": "/lay", "name": "a"})
+        self._post("/create", {"type": "null", "parent": "/lay", "name": "b"})
+        self._post("/connect", {"from": "/lay/a", "to": "/lay/b"})
+        before = td_api._td().op("/lay/a").nodeX
+        status, body = self._post("/layout", {"path": "/lay"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["mode"], "preview")
+        plan_paths = {p["path"] for p in data["plan"]}
+        self.assertEqual(plan_paths, {"/lay/a", "/lay/b"})
+        # a feeds b, so a is planned left of b in LR layout.
+        tx = {p["path"]: p["to"][0] for p in data["plan"]}
+        self.assertLess(tx["/lay/a"], tx["/lay/b"])
+        # Preview must NOT move the ops.
+        self.assertEqual(td_api._td().op("/lay/a").nodeX, before)
+
+    def test_layout_apply_moves_nodes(self):
+        self._post("/create", {"type": "base", "parent": "/", "name": "lay3"})
+        self._post("/create", {"type": "null", "parent": "/lay3", "name": "a"})
+        self._post("/create", {"type": "null", "parent": "/lay3", "name": "b"})
+        self._post("/connect", {"from": "/lay3/a", "to": "/lay3/b"})
+        status, body = self._post("/layout", {"path": "/lay3", "apply": True})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["mode"], "applied")
+        to = {p["path"]: p["to"] for p in data["plan"]}
+        self.assertEqual(td_api._td().op("/lay3/a").nodeX, to["/lay3/a"][0])
+
+    def test_layout_excludes_named(self):
+        self._post("/create", {"type": "base", "parent": "/", "name": "lay4"})
+        self._post("/create", {"type": "null", "parent": "/lay4", "name": "keep"})
+        self._post("/create", {"type": "null", "parent": "/lay4", "name": "skip"})
+        status, body = self._post("/layout", {"path": "/lay4", "exclude": ["skip"]})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertIn("/lay4/skip", data["excluded"])
+        self.assertNotIn("/lay4/skip", {p["path"] for p in data["plan"]})
+
+    def test_layout_empty_subnet(self):
+        self._post("/create", {"type": "base", "parent": "/", "name": "empty1"})
+        status, body = self._post("/layout", {"path": "/empty1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["plan"], [])
 
 
 if __name__ == "__main__":

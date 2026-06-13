@@ -1,6 +1,6 @@
 {
   "name": "touch",
   "description": "TouchDesigner integration for Claude Code — execute Python, query editor state, render, and introspect networks.",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "author": { "name": "zauster90" }
 }

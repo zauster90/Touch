@@ -40,21 +40,31 @@ m.ParMode = ParMode  # needed by /bind to switch a parameter to expression mode
 sys.modules["td_runtime"] = m
 '''
 
-BOOTSTRAP_SRC = '''def onStart():
+BOOTSTRAP_SRC = '''import sys
+
+def onStart():
     op('td_runtime_shim').run()
-    parent().op('td_api_src').module.start_server()
+    # td_layout is a pure-Python sibling DAT used by the /layout endpoint. TD
+    # can import sibling DATs directly, but register it explicitly so
+    # td_api_src's `import td_layout` is bulletproof across TD versions.
+    sys.modules['td_layout'] = mod('td_layout')
+    mod('td_api_src').start_server()
     parent().par.Status = f"READY @ 127.0.0.1:{parent().par.Port.eval()}"
 
 def onExit():
     try:
-        parent().op('td_api_src').module.stop_server()
+        mod('td_api_src').stop_server()
     finally:
         parent().par.Status = "stopped"
+
+def onFrameStart(frame):
+    # Drain HTTP-worker-thread work onto TD's main cook thread every frame.
+    # TD's Python API is main-thread-only; this is what makes it safe.
+    mod('td_api_src').drain_main_queue()
 '''
 
 ROTATE_CALLBACK_SRC = '''def onPulse(par):
-    if par.name == 'Rotate':
-        parent().op('td_api_src').module.rotate_token()
+    mod('td_api_src').rotate_token()
 '''
 
 
@@ -80,11 +90,11 @@ def _find_toe_dir():
     )
 
 
-def _read_api_source():
+def _read_src(filename):
     import os
-    src_path = os.path.join(_find_toe_dir(), "src", "td_api.py")
+    src_path = os.path.join(_find_toe_dir(), "src", filename)
     if not os.path.exists(src_path):
-        raise RuntimeError(f"td_api.py not found at {src_path}")
+        raise RuntimeError(f"{filename} not found at {src_path}")
     with open(src_path, "r", encoding="utf-8") as fh:
         return fh.read()
 
@@ -129,7 +139,7 @@ def _wire_rotate(comp):
     """Best-effort: a Parameter Execute DAT that calls rotate_token on pulse.
     The server runs fine without this; only token rotation depends on it."""
     try:
-        pe = comp.create(parameterexecuteDAT, "param_callbacks")  # noqa: F821
+        pe = comp.create(parameterexecuteDAT, "param_exec")  # noqa: F821
         pe.text = ROTATE_CALLBACK_SRC
         _set_python(pe)
         pe.par.op = comp
@@ -144,7 +154,8 @@ def _wire_rotate(comp):
 
 
 def build():
-    api_src = _read_api_source()
+    api_src = _read_src("td_api.py")
+    layout_src = _read_src("td_layout.py")
 
     root = op(PARENT_PATH) or me.parent()  # noqa: F821
     _teardown(root)
@@ -156,6 +167,11 @@ def build():
     _set_python(src_dat)
     src_dat.nodeX, src_dat.nodeY = 0, 0
 
+    layout_dat = comp.create(textDAT, "td_layout")  # noqa: F821
+    layout_dat.text = layout_src
+    _set_python(layout_dat)
+    layout_dat.nodeX, layout_dat.nodeY = 0, 150
+
     shim = comp.create(textDAT, "td_runtime_shim")  # noqa: F821
     shim.text = SHIM_SRC
     _set_python(shim)
@@ -164,7 +180,9 @@ def build():
     boot = comp.create(executeDAT, "bootstrap")  # noqa: F821
     boot.text = BOOTSTRAP_SRC
     _set_python(boot)
-    for pname in ("start", "exit", "active"):
+    # start: launch server; exit: stop it; framestart: drain the main-thread
+    # queue every frame (required for thread-safe op access).
+    for pname in ("start", "exit", "framestart", "active"):
         p = getattr(boot.par, pname, None)
         if p is not None:
             p.val = True

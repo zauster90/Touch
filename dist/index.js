@@ -21139,8 +21139,11 @@ async function deleteTool(args) {
 async function bindTool(args) {
   return asText(await postJson("/bind", args));
 }
+async function layoutTool(args) {
+  return asText(await postJson("/layout", args));
+}
 function buildServer() {
-  const server = new McpServer({ name: "touch", version: "0.2.0" });
+  const server = new McpServer({ name: "touch", version: "0.3.0" });
   server.registerTool("td_execute", {
     title: "Execute Python in TouchDesigner",
     description: "Run Python code inside TD. `me` refers to the from_op context operator.",
@@ -21238,6 +21241,20 @@ function buildServer() {
       val: external_exports.any().optional()
     }
   }, bindTool);
+  server.registerTool("td_layout", {
+    title: "Auto-arrange a subnet",
+    description: "Layered DAG layout (Sugiyama) of the direct children of `path`. Reads wires + tile sizes and untangles crossings. Returns a preview `plan` by default; pass `apply: true` to write nodeX/nodeY. Use `exclude` (names/paths) or `selection_only` to scope it.",
+    inputSchema: {
+      path: external_exports.string(),
+      apply: external_exports.boolean().optional(),
+      direction: external_exports.enum(["LR", "TB"]).optional(),
+      spacing: external_exports.object({ rank: external_exports.number(), node: external_exports.number() }).optional(),
+      rank_gap: external_exports.number().optional(),
+      node_gap: external_exports.number().optional(),
+      selection_only: external_exports.boolean().optional(),
+      exclude: external_exports.array(external_exports.string()).optional()
+    }
+  }, layoutTool);
   return server;
 }
 async function main() {
@@ -21263,6 +21280,7 @@ export {
   errorsTool,
   executeTool,
   graphTool,
+  layoutTool,
   operatorsTool,
   paneTool,
   paramsTool,

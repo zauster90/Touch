@@ -1,8 +1,8 @@
 # Tools
 
-Which of the 16 Touch MCP tools to reach for, and in what order. The heuristic: **read before write, structured before scripted, verify after every batch.**
+Which of the 17 Touch MCP tools to reach for, and in what order. The heuristic: **read before write, structured before scripted, verify after every batch.**
 
-## The 16 tools at a glance
+## The 17 tools at a glance
 
 | Tool | Purpose | Mutates? |
 |------|---------|----------|
@@ -21,7 +21,19 @@ Which of the 16 Touch MCP tools to reach for, and in what order. The heuristic: 
 | `td_disconnect` | Drop wires into an op's input(s) | write |
 | `td_delete` | Destroy an op | write |
 | `td_bind` | Bind a parameter to an expression / constant | write |
+| `td_layout` | Auto-arrange a subnet (preview, or `apply`) | both |
 | `td_execute` | Run arbitrary Python in TD | write (arbitrary) |
+
+## Tidying layouts with `td_layout`
+
+After building or rewiring a subnet, the new ops pile up at the origin. `td_layout`
+runs a layered-DAG (Sugiyama) arrange over the direct children of `path`:
+
+- It **previews by default** — returns a `plan` of `from`/`to` positions, plus
+  `broken_edges` (wires it would cut to break cycles) and `overlaps`, without
+  moving anything. Pass `apply: true` to actually write `nodeX`/`nodeY`.
+- Scope it with `exclude` (names or paths to leave put — e.g. the `TouchAPI`
+  COMP itself) or `selection_only`. Use `direction: "TB"` for top-to-bottom.
 
 ## Seeing the data, not just the graph
 

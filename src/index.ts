@@ -161,13 +161,20 @@ export async function deleteTool(args: { path: string }) {
 export async function bindTool(args: { path: string; param: string; expr?: string; mode?: string; val?: unknown }) {
   return asText(await postJson("/bind", args));
 }
+export async function layoutTool(args: {
+  path: string; apply?: boolean; direction?: "LR" | "TB";
+  spacing?: { rank: number; node: number }; rank_gap?: number; node_gap?: number;
+  selection_only?: boolean; exclude?: string[];
+}) {
+  return asText(await postJson("/layout", args));
+}
 
 // ---------------------------------------------------------------------------
 // MCP server wiring
 // ---------------------------------------------------------------------------
 
 function buildServer(): McpServer {
-  const server = new McpServer({ name: "touch", version: "0.2.0" });
+  const server = new McpServer({ name: "touch", version: "0.3.0" });
 
   server.registerTool("td_execute", {
     title: "Execute Python in TouchDesigner",
@@ -281,6 +288,21 @@ function buildServer(): McpServer {
       val: z.any().optional(),
     },
   }, bindTool);
+
+  server.registerTool("td_layout", {
+    title: "Auto-arrange a subnet",
+    description: "Layered DAG layout (Sugiyama) of the direct children of `path`. Reads wires + tile sizes and untangles crossings. Returns a preview `plan` by default; pass `apply: true` to write nodeX/nodeY. Use `exclude` (names/paths) or `selection_only` to scope it.",
+    inputSchema: {
+      path: z.string(),
+      apply: z.boolean().optional(),
+      direction: z.enum(["LR", "TB"]).optional(),
+      spacing: z.object({ rank: z.number(), node: z.number() }).optional(),
+      rank_gap: z.number().optional(),
+      node_gap: z.number().optional(),
+      selection_only: z.boolean().optional(),
+      exclude: z.array(z.string()).optional(),
+    },
+  }, layoutTool);
 
   return server;
 }

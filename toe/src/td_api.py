@@ -12,6 +12,7 @@ import hmac
 import io
 import json
 import os
+import queue
 import secrets
 import sys
 import tempfile
@@ -91,6 +92,51 @@ def get_log() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Main-thread marshaling
+# ---------------------------------------------------------------------------
+# TD's Python API (op(), ui.*, par access) is only safe on the main cook
+# thread. The HTTP server runs handlers on worker threads, so we queue work
+# here and drain it from an Execute DAT's onFrameStart callback.
+
+_main_q: queue.Queue = queue.Queue()
+
+
+def run_on_main(fn: Callable[[], Any], timeout: float = 5.0) -> Any:
+    ev = threading.Event()
+    box: list = [None, None]  # [result, exception]
+
+    def wrapped():
+        try:
+            box[0] = fn()
+        except BaseException as e:  # noqa: BLE001
+            box[1] = e
+        finally:
+            ev.set()
+
+    _main_q.put(wrapped)
+    if not ev.wait(timeout=timeout):
+        raise TimeoutError(f"main-thread call timed out after {timeout}s")
+    if box[1] is not None:
+        raise box[1]
+    return box[0]
+
+
+def drain_main_queue() -> int:
+    """Call from TD main thread every frame. Returns tasks executed."""
+    n = 0
+    while True:
+        try:
+            fn = _main_q.get_nowait()
+        except queue.Empty:
+            return n
+        try:
+            fn()
+        except Exception:
+            log(f"main-thread task error:\n{traceback.format_exc()}")
+        n += 1
+
+
+# ---------------------------------------------------------------------------
 # Router — endpoints register via @route
 # ---------------------------------------------------------------------------
 
@@ -152,11 +198,22 @@ class TDHandler(BaseHTTPRequestHandler):
         self.end_headers()
         log(f"DENY {code} {reason} {self.path}")
 
+    # JSON serialization fallback. Runs on the HTTP worker thread — must NOT
+    # access TD OP attributes from here (TD detects cross-thread access and
+    # pops a modal that blocks the main cook thread, wedging the whole app).
+    # The endpoint is responsible for coercing any OPs to plain str/int/etc.
+    # on the main thread before returning. If an OP slips through anyway,
+    # return a safe placeholder instead of dereffing it.
+    @staticmethod
+    def _json_coerce(o):
+        # type().__name__ is always safe — no TD OP attribute access.
+        return f"<unserializable:{type(o).__name__}>"
+
     def _respond(self, status: int, body: Any, *, content_type: str = "application/json") -> None:
         if isinstance(body, (bytes, bytearray)):
             payload = bytes(body)
         else:
-            payload = json.dumps(body).encode("utf-8")
+            payload = json.dumps(body, default=self._json_coerce).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
@@ -182,7 +239,9 @@ class TDHandler(BaseHTTPRequestHandler):
 
         ctx = Ctx(self, parse_qs(parsed.query), body)
         try:
-            status, payload = endpoint(ctx)
+            # Marshal endpoint execution onto TD's main cook thread.
+            # TD Python API (op(), ui.*, par access) is not thread-safe.
+            status, payload = run_on_main(lambda: endpoint(ctx))
         except Exception as exc:  # noqa: BLE001
             log(f"ERR {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
             return self._respond(500, {"error": {"type": type(exc).__name__, "message": str(exc)}})
@@ -190,9 +249,23 @@ class TDHandler(BaseHTTPRequestHandler):
         if isinstance(payload, tuple) and len(payload) == 2 and isinstance(payload[1], (bytes, bytearray)):
             # (content_type, bytes) form — for binary responses like PNG.
             content_type, data = payload
-            return self._respond(status, data, content_type=content_type)
+            try:
+                return self._respond(status, data, content_type=content_type)
+            except Exception as exc:  # noqa: BLE001
+                log(f"ERR respond-binary {type(exc).__name__}: {exc}")
+                return self._respond(500, {"error": {"type": type(exc).__name__, "message": str(exc)}})
 
-        self._respond(status, payload)
+        # Guard the final JSON response too — if it throws (e.g. un-serializable
+        # object slipped through _json_coerce), fall back to a 500 rather than
+        # letting the exception kill the single-threaded HTTP worker.
+        try:
+            self._respond(status, payload)
+        except Exception as exc:  # noqa: BLE001
+            log(f"ERR respond-json {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+            try:
+                self._respond(500, {"error": {"type": type(exc).__name__, "message": str(exc)}})
+            except Exception:  # noqa: BLE001
+                pass
 
     def do_GET(self): self._handle("GET")
     def do_POST(self): self._handle("POST")
@@ -329,147 +402,6 @@ def _execute(ctx: Ctx):
 
 
 # ---------------------------------------------------------------------------
-# Endpoints — mutation & complex
-# ---------------------------------------------------------------------------
-
-@route("GET", "/params")
-def _params_get(ctx: Ctx):
-    td = _td()
-    path = ctx.q("path")
-    if not path:
-        return 400, {"error": {"type": "BadInput", "message": "path required"}}
-    o = td.op(path)
-    if o is None:
-        return 404, {"error": {"type": "NotFound", "message": path}}
-    pars: dict[str, Any] = {}
-    try:
-        names = [n for n in dir(o.par) if not n.startswith("_")]
-    except Exception:  # noqa: BLE001
-        names = []
-    for name in names:
-        try:
-            val = getattr(o.par, name)
-            pars[name] = val.eval if hasattr(val, "eval") else val
-        except Exception:  # noqa: BLE001
-            pass
-    return 200, {"path": path, "params": pars}
-
-
-@route("PATCH", "/params")
-def _params_set(ctx: Ctx):
-    td = _td()
-    path = ctx.q("path")
-    if not path:
-        return 400, {"error": {"type": "BadInput", "message": "path required"}}
-    o = td.op(path)
-    if o is None:
-        return 404, {"error": {"type": "NotFound", "message": path}}
-    updates = ctx.json() or {}
-    applied: dict[str, Any] = {}
-    for k, v in updates.items():
-        par = getattr(o.par, k, None)
-        try:
-            if par is not None and hasattr(par, "val"):
-                par.val = v
-            else:
-                # Create-or-set via attribute — _FakeParGroup and TD both support this.
-                setattr(o.par, k, v)
-            applied[k] = v
-        except Exception as exc:  # noqa: BLE001
-            applied[k] = {"error": str(exc)}
-    return 200, {"path": path, "applied": applied}
-
-
-@route("POST", "/create")
-def _create(ctx: Ctx):
-    td = _td()
-    data = ctx.json() or {}
-    type_ = data.get("type")
-    parent = data.get("parent", "/")
-    name = data.get("name")
-    pos = data.get("pos")
-    inputs = data.get("inputs") or []
-    if not type_:
-        return 400, {"error": {"type": "BadInput", "message": "type required"}}
-    p = td.op(parent)
-    if p is None:
-        return 404, {"error": {"type": "NotFound", "message": parent}}
-    if not hasattr(p, "create"):
-        return 500, {"error": {"type": "CreateFailed", "message": "op has no create()"}}
-    child = p.create(type_, name=name)
-    if pos and hasattr(child, "nodeX"):
-        try:
-            child.nodeX, child.nodeY = int(pos[0]), int(pos[1])
-        except Exception:  # noqa: BLE001
-            pass
-    for i, src in enumerate(inputs):
-        s = td.op(src)
-        if s is None:
-            continue
-        try:
-            child.inputConnectors[i].connect(s.outputConnectors[0])
-        except Exception:  # noqa: BLE001
-            pass
-    return 200, _op_info(child)
-
-
-@route("GET", "/graph")
-def _graph(ctx: Ctx):
-    td = _td()
-    path = ctx.q("path", "/") or "/"
-    try:
-        depth = int(ctx.q("depth", "2") or "2")
-    except ValueError:
-        return 400, {"error": {"type": "BadInput", "message": "depth must be integer"}}
-    root = td.op(path)
-    if root is None:
-        return 404, {"error": {"type": "NotFound", "message": path}}
-    nodes: list[dict] = []
-
-    def walk(n, d):
-        inputs: list[str] = []
-        for ic in getattr(n, "inputConnectors", []) or []:
-            for conn in getattr(ic, "connections", []) or []:
-                owner = getattr(conn, "owner", None)
-                if owner is not None:
-                    owner_path = getattr(owner, "path", None)
-                    if owner_path is not None:
-                        inputs.append(owner_path)
-        nodes.append({**_op_info(n), "inputs": inputs})
-        if d <= 0:
-            return
-        for c in n.findChildren(depth=1):
-            walk(c, d - 1)
-
-    walk(root, depth)
-    return 200, {"path": path, "depth": depth, "nodes": nodes}
-
-
-@route("GET", "/screenshot")
-def _screenshot(ctx: Ctx):
-    td = _td()
-    path = ctx.q("path")
-    if not path:
-        return 400, {"error": {"type": "BadInput", "message": "path required"}}
-    o = td.op(path)
-    if o is None:
-        return 404, {"error": {"type": "NotFound", "message": path}}
-    if not hasattr(o, "save"):
-        return 400, {"error": {"type": "BadOp", "message": "op has no .save (not a TOP?)"}}
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        tmp = f.name
-    try:
-        o.save(tmp)
-        data = Path(tmp).read_bytes()
-    finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-    return 200, ("image/png", data)
-
-
-# ---------------------------------------------------------------------------
 # Endpoints — data readback (CHOP / DAT) and performance
 # ---------------------------------------------------------------------------
 
@@ -570,8 +502,138 @@ def _perf(ctx: Ctx):
 
 
 # ---------------------------------------------------------------------------
-# Endpoints — wiring & lifecycle
+# Endpoints — mutation & complex
 # ---------------------------------------------------------------------------
+
+@route("GET", "/params")
+def _params_get(ctx: Ctx):
+    td = _td()
+    path = ctx.q("path")
+    if not path:
+        return 400, {"error": {"type": "BadInput", "message": "path required"}}
+    o = td.op(path)
+    if o is None:
+        return 404, {"error": {"type": "NotFound", "message": path}}
+    # Use `o.pars()` — the canonical TD API for enumerating a node's parameters.
+    # `dir(o.par)` returns pseudo-attributes like `owner` (raw OP reference) that
+    # leak into the response and trigger TD's cross-thread safety dialog when
+    # JSON serialization tries to read `.path` from the HTTP worker thread.
+    # All OP coercion MUST happen on THIS (main) thread before returning.
+    pars: dict[str, Any] = {}
+    try:
+        par_list = list(o.pars())
+    except Exception:  # noqa: BLE001
+        par_list = []
+    for par in par_list:
+        try:
+            evaluated = par.eval()
+            # OP-typed pars (TOP/CHOP/COMP/DAT/SOP/MAT/POP) return an OP object;
+            # coerce to its .path here (on the main thread) so the HTTP thread
+            # never touches a TD OP during JSON serialization.
+            if evaluated is not None and hasattr(evaluated, "path") and hasattr(evaluated, "family"):
+                evaluated = evaluated.path
+            pars[par.name] = evaluated
+        except Exception:  # noqa: BLE001
+            pass
+    return 200, {"path": path, "params": pars}
+
+
+@route("PATCH", "/params")
+def _params_set(ctx: Ctx):
+    td = _td()
+    path = ctx.q("path")
+    if not path:
+        return 400, {"error": {"type": "BadInput", "message": "path required"}}
+    o = td.op(path)
+    if o is None:
+        return 404, {"error": {"type": "NotFound", "message": path}}
+    updates = ctx.json() or {}
+    applied: dict[str, Any] = {}
+    for k, v in updates.items():
+        par = getattr(o.par, k, None)
+        try:
+            if par is not None and hasattr(par, "val"):
+                par.val = v
+            else:
+                # Create-or-set via attribute — _FakeParGroup and TD both support this.
+                setattr(o.par, k, v)
+            applied[k] = v
+        except Exception as exc:  # noqa: BLE001
+            applied[k] = {"error": str(exc)}
+    return 200, {"path": path, "applied": applied}
+
+
+@route("POST", "/bind")
+def _bind(ctx: Ctx):
+    """Bind a parameter reactively. `mode` = "expression" (default) sets
+    `param.expr` (e.g. "op('audio')['rms']"); "constant" sets a fixed `val`.
+    ParMode is bridged through td_runtime; if absent the value/expr is still
+    written and the mode left untouched."""
+    td = _td()
+    data = ctx.json() or {}
+    path, param = data.get("path"), data.get("param")
+    if not path or not param:
+        return 400, {"error": {"type": "BadInput", "message": "path and param required"}}
+    o = td.op(path)
+    if o is None:
+        return 404, {"error": {"type": "NotFound", "message": path}}
+    par = getattr(o.par, param, None)
+    if par is None:
+        return 404, {"error": {"type": "NotFound", "message": f"{path}.par.{param}"}}
+    mode = (data.get("mode") or "expression").lower()
+    par_mode = getattr(td, "ParMode", None)
+    expr = data.get("expr")
+    try:
+        if mode == "constant":
+            if "val" in data:
+                par.val = data["val"]
+            if par_mode is not None:
+                par.mode = par_mode.CONSTANT
+        elif mode == "expression":
+            if expr is None:
+                return 400, {"error": {"type": "BadInput", "message": "expr required for expression mode"}}
+            par.expr = expr
+            if par_mode is not None:
+                par.mode = par_mode.EXPRESSION
+        else:
+            return 400, {"error": {"type": "BadInput", "message": f"unknown mode: {mode}"}}
+    except Exception as exc:  # noqa: BLE001
+        return 200, {"success": False, "error": {"type": type(exc).__name__, "message": str(exc)}}
+    return 200, {"success": True, "path": path, "param": param, "mode": mode, "expr": expr}
+
+
+@route("POST", "/create")
+def _create(ctx: Ctx):
+    td = _td()
+    data = ctx.json() or {}
+    type_ = data.get("type")
+    parent = data.get("parent", "/")
+    name = data.get("name")
+    pos = data.get("pos")
+    inputs = data.get("inputs") or []
+    if not type_:
+        return 400, {"error": {"type": "BadInput", "message": "type required"}}
+    p = td.op(parent)
+    if p is None:
+        return 404, {"error": {"type": "NotFound", "message": parent}}
+    if not hasattr(p, "create"):
+        return 500, {"error": {"type": "CreateFailed", "message": "op has no create()"}}
+    child = p.create(type_, name=name)
+    if pos and hasattr(child, "nodeX"):
+        try:
+            child.nodeX, child.nodeY = int(pos[0]), int(pos[1])
+        except Exception:  # noqa: BLE001
+            pass
+    for i, src in enumerate(inputs):
+        s = td.op(src)
+        if s is None:
+            continue
+        try:
+            child.inputConnectors[i].connect(s.outputConnectors[0])
+        except Exception:  # noqa: BLE001
+            pass
+    return 200, _op_info(child)
+
 
 @route("POST", "/connect")
 def _connect(ctx: Ctx):
@@ -639,40 +701,147 @@ def _delete(ctx: Ctx):
     return 200, {"success": True, "deleted": info}
 
 
-@route("POST", "/bind")
-def _bind(ctx: Ctx):
-    """Bind a parameter reactively. `mode` = "expression" (default) sets
-    `param.expr` (e.g. "op('audio')['rms']"); "constant" sets a fixed `val`.
-    ParMode is bridged through td_runtime; if absent the value/expr is still
-    written and the mode left untouched."""
+@route("POST", "/layout")
+def _layout(ctx: Ctx):
+    import td_layout  # local import so engine errors don't brick the server on boot.
     td = _td()
     data = ctx.json() or {}
-    path, param = data.get("path"), data.get("param")
-    if not path or not param:
-        return 400, {"error": {"type": "BadInput", "message": "path and param required"}}
+    path = data.get("path")
+    if not path:
+        return 400, {"error": {"type": "BadInput", "message": "path required"}}
+    parent = td.op(path)
+    if parent is None:
+        return 404, {"error": {"type": "NotFound", "message": path}}
+
+    selection_only = bool(data.get("selection_only", False))
+    direction = data.get("direction", "LR")
+    spacing = data.get("spacing") or {}
+    apply_changes = bool(data.get("apply", False))
+    rank_gap = data.get("rank_gap")
+    node_gap = data.get("node_gap")
+    # exclude: list of child names OR full paths to omit from layout. Curated
+    # subnets (plugins, vendor COMPs) that the caller doesn't want the layout
+    # engine to reposition OR link to via edges.
+    exclude_raw = data.get("exclude") or []
+    exclude_names = {e for e in exclude_raw if isinstance(e, str)}
+
+    # Collect nodes + wires, filtering out excluded children before building
+    # either node list or edge list — excluded ops keep their current position.
+    children_all = parent.findChildren(depth=1)
+    if selection_only:
+        children_all = [c for c in children_all if getattr(c, "selected", False)]
+    def _is_excluded(c):
+        return c.name in exclude_names or c.path in exclude_names
+    children = [c for c in children_all if not _is_excluded(c)]
+    excluded = [c.path for c in children_all if _is_excluded(c)]
+    child_by_path = {c.path: c for c in children}
+
+    nodes = [
+        {"id": c.path, "is_feedback_top": getattr(c, "type", "") == "feedbackTOP"}
+        for c in children
+    ]
+    # Size map for size-aware placement — TD's node-editor dimensions in pixels.
+    sizes = {
+        c.path: (int(getattr(c, "nodeWidth", 0) or 0),
+                 int(getattr(c, "nodeHeight", 0) or 0))
+        for c in children
+    }
+    edges: list[dict] = []
+    for c in children:
+        for ic in getattr(c, "inputConnectors", []) or []:
+            for conn in getattr(ic, "connections", []) or []:
+                owner = getattr(conn, "owner", None)
+                owner_path = getattr(owner, "path", None) if owner is not None else None
+                if owner_path and owner_path in child_by_path:
+                    edges.append({"from": owner_path, "to": c.path})
+
+    layout_input: dict = {
+        "nodes": nodes, "edges": edges, "sizes": sizes,
+        "direction": direction, "spacing": spacing,
+    }
+    if rank_gap is not None:
+        layout_input["rank_gap"] = int(rank_gap)
+    if node_gap is not None:
+        layout_input["node_gap"] = int(node_gap)
+    result = td_layout.layout(layout_input)
+
+    if "error" in result:
+        return 400, result
+
+    plan = []
+    for cp, (x, y) in result["positions"].items():
+        child = child_by_path.get(cp)
+        from_xy = (getattr(child, "nodeX", 0), getattr(child, "nodeY", 0)) if child else (0, 0)
+        plan.append({"path": cp, "from": list(from_xy), "to": [int(x), int(y)]})
+
+    if apply_changes:
+        for cp, (x, y) in result["positions"].items():
+            c = child_by_path.get(cp)
+            if c is not None and hasattr(c, "nodeX"):
+                c.nodeX, c.nodeY = int(x), int(y)
+
+    return 200, {
+        "mode": "applied" if apply_changes else "preview",
+        "target": path,
+        "plan": plan,
+        "broken_edges": result["broken_edges"],
+        "overlaps": result.get("overlaps", []),
+        "excluded": excluded,
+        "stats": result["stats"],
+    }
+
+
+@route("GET", "/graph")
+def _graph(ctx: Ctx):
+    td = _td()
+    path = ctx.q("path", "/") or "/"
+    try:
+        depth = int(ctx.q("depth", "2") or "2")
+    except ValueError:
+        return 400, {"error": {"type": "BadInput", "message": "depth must be integer"}}
+    root = td.op(path)
+    if root is None:
+        return 404, {"error": {"type": "NotFound", "message": path}}
+    nodes: list[dict] = []
+
+    def walk(n, d):
+        inputs: list[str] = []
+        for ic in getattr(n, "inputConnectors", []) or []:
+            for conn in getattr(ic, "connections", []) or []:
+                owner = getattr(conn, "owner", None)
+                if owner is not None:
+                    owner_path = getattr(owner, "path", None)
+                    if owner_path is not None:
+                        inputs.append(owner_path)
+        nodes.append({**_op_info(n), "inputs": inputs})
+        if d <= 0:
+            return
+        for c in n.findChildren(depth=1):
+            walk(c, d - 1)
+
+    walk(root, depth)
+    return 200, {"path": path, "depth": depth, "nodes": nodes}
+
+
+@route("GET", "/screenshot")
+def _screenshot(ctx: Ctx):
+    td = _td()
+    path = ctx.q("path")
+    if not path:
+        return 400, {"error": {"type": "BadInput", "message": "path required"}}
     o = td.op(path)
     if o is None:
         return 404, {"error": {"type": "NotFound", "message": path}}
-    par = getattr(o.par, param, None)
-    if par is None:
-        return 404, {"error": {"type": "NotFound", "message": f"{path}.par.{param}"}}
-    mode = (data.get("mode") or "expression").lower()
-    par_mode = getattr(td, "ParMode", None)
-    expr = data.get("expr")
+    if not hasattr(o, "save"):
+        return 400, {"error": {"type": "BadOp", "message": "op has no .save (not a TOP?)"}}
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        tmp = f.name
     try:
-        if mode == "constant":
-            if "val" in data:
-                par.val = data["val"]
-            if par_mode is not None:
-                par.mode = par_mode.CONSTANT
-        elif mode == "expression":
-            if expr is None:
-                return 400, {"error": {"type": "BadInput", "message": "expr required for expression mode"}}
-            par.expr = expr
-            if par_mode is not None:
-                par.mode = par_mode.EXPRESSION
-        else:
-            return 400, {"error": {"type": "BadInput", "message": f"unknown mode: {mode}"}}
-    except Exception as exc:  # noqa: BLE001
-        return 200, {"success": False, "error": {"type": type(exc).__name__, "message": str(exc)}}
-    return 200, {"success": True, "path": path, "param": param, "mode": mode, "expr": expr}
+        o.save(tmp)
+        data = Path(tmp).read_bytes()
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return 200, ("image/png", data)

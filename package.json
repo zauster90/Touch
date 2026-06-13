@@ -1,6 +1,6 @@
 {
   "name": "touch",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Claude Code plugin for TouchDesigner — MCP tools for networks, params, rendering, and shaders.",
   "type": "module",

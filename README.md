@@ -4,13 +4,13 @@ A Claude Code plugin that exposes TouchDesigner to Claude via MCP: execute Pytho
 
 ## Status
 
-v0.2 — local-only install. Requires TouchDesigner 2025+ and Node 20+. Developed and tested on Windows 11. POSIX paths are handled but unverified end-to-end.
+v0.3 — local-only install. Requires TouchDesigner 2025+ and Node 20+. Developed and tested on Windows 11. POSIX paths are handled but unverified end-to-end.
 
-> **Upgrading from v0.1:** the new `td_bind` tool needs the `td_runtime` shim to bridge `ParMode`. Rebuild `TouchAPI.tox` with the updated shim in [`toe/BUILD_TOX.md`](toe/BUILD_TOX.md). The other six new tools work against the existing `.tox` once `toe/src/td_api.py` is re-synced into it.
+> **Upgrading from v0.1/v0.2:** rebuild the `TouchAPI` component — easiest via [`toe/install.py`](toe/install.py). v0.3 marshals every request onto TD's main cook thread (`bootstrap.onFrameStart` → `drain_main_queue`), which is required for safe op access; it also adds a `td_layout` DAT and the `ParMode` shim bridge. An older `.tox` that lacks the `onFrameStart` drain will accept requests but time them out.
 
 ## What it does
 
-Sixteen MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint hosted inside TouchDesigner:
+Seventeen MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint hosted inside TouchDesigner:
 
 | Tool | Description | Example prompt |
 |---|---|---|
@@ -30,6 +30,7 @@ Sixteen MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint ho
 | `td_disconnect` | Drop wires into an operator's input(s). | "Disconnect `comp1`'s inputs." |
 | `td_delete` | Destroy an operator. | "Delete `noise2`." |
 | `td_bind` | Bind a parameter to an expression (reactive) or constant. | "Drive `geo1.tx` off `op('lfo1')['chan1']`." |
+| `td_layout` | Auto-arrange a subnet (layered DAG / Sugiyama), untangling wire crossings. | "Tidy up the layout under `/project1`." |
 
 ## Security posture
 
@@ -81,10 +82,10 @@ Clone, install, test, build:
 
 ```bash
 npm install
-npm run test        # 12 TS unit tests (client wrapper)
-python -m pytest tests/python_api_test.py   # 36 Python tests (server core)
+npm run test        # 13 TS unit tests (client wrapper)
+python -m pytest tests/python_api_test.py tests/layout_test.py   # 53 Python tests (server core + layout)
 npm run build       # bundles src/index.ts -> dist/index.js
-npm run smoke       # exercises 8 tools against a live TD (see tests/manual.md)
+npm run smoke       # exercises 9 tools against a live TD (see tests/manual.md)
 ```
 
 Regenerating the `.tox`: see [`toe/BUILD_TOX.md`](toe/BUILD_TOX.md). After rebuilding, audit the `.tox` with:
@@ -107,6 +108,7 @@ Touch/
 │   ├── install.py              # one-shot in-TD builder for the TouchAPI component
 │   ├── TouchAPI.tox            # optional built binary (produce via Save Component .tox)
 │   ├── src/td_api.py           # authoritative Python server source
+│   ├── src/td_layout.py        # pure-stdlib layered-DAG layout (no TD deps)
 │   └── BUILD_TOX.md            # install.py fast path + manual build recipe
 ├── tests/
 │   ├── api.test.ts              # TS client unit tests

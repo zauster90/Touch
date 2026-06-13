@@ -63,6 +63,8 @@ beforeAll(async () => {
         return res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({success:true, deleted:{name:"x"}}));
       if (url.startsWith("/bind"))
         return res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({success:true, mode:"expression"}));
+      if (url.startsWith("/layout"))
+        return res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({mode:"preview", target:"/project1", plan:[], broken_edges:[], overlaps:[], excluded:[], stats:{nodes:2}}));
       res.writeHead(404).end();
     });
   });
@@ -176,5 +178,18 @@ describe("td() client", () => {
     const call = calls.at(-1)!;
     expect(call.method).toBe("POST");
     expect(JSON.parse(call.body).expr).toBe("op('lfo1')['chan1']");
+  });
+
+  it("layoutTool POSTs path + options and previews by default", async () => {
+    const { layoutTool } = await import("../src/index.js");
+    calls.length = 0;
+    const out = await layoutTool({ path: "/project1", direction: "TB", exclude: ["TouchAPI"] });
+    const call = calls.at(-1)!;
+    expect(call.method).toBe("POST");
+    const sent = JSON.parse(call.body);
+    expect(sent.path).toBe("/project1");
+    expect(sent.direction).toBe("TB");
+    expect(sent.exclude).toEqual(["TouchAPI"]);
+    expect(out.content[0].text).toContain('"mode": "preview"');
   });
 });

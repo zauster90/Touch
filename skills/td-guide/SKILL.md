@@ -13,6 +13,7 @@ Reference for building TouchDesigner networks with the Touch MCP tools.
 - Want to **read** the data flowing through it? `td_chop` (channel values), `td_dat` (table cells), `td_params` (parameter values).
 - Want to **create** an op? `td_create` (supports `inputs` array for wiring on create).
 - Want to **rewire / remove**? `td_connect`, `td_disconnect`, `td_delete`.
+- Just built a net and it's a tangled pile at the origin? `td_layout` (preview first, then `apply: true`).
 - Want to **tweak** parameters? `td_params` with a `params: {...}` object. Avoid `td_execute` for simple tweaks.
 - Want a parameter to **react** to a signal (audio, LFO, time)? `td_bind` with an `expr` — not `td_params`.
 - Chasing dropped frames? `td_perf` to find the slowest-cooking op.
