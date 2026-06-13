@@ -2,7 +2,22 @@
 
 How to construct or rebuild the `TouchAPI` component from scratch in TouchDesigner using the authoritative source at [`toe/src/td_api.py`](src/td_api.py).
 
-The `.tox` is a binary TD component. It can't be generated from a script — TD's UI is the build tool. These steps are the build recipe.
+The `.tox` is a binary TD component. It can't be generated from a script *outside* TD — TD's UI is the build tool. But you don't have to assemble it by hand: an installer script automates every step below from inside TD.
+
+## Fast path: `install.py` (recommended)
+
+1. Drag [`toe/install.py`](install.py) into a TD network (TD creates a Text DAT from it).
+2. Right-click that DAT → **Run Script**.
+
+It creates `/project1/TouchAPI`, adds the three DATs, the token-rotation callback, and the custom parameters, then starts the server — the `Status` parameter should read `READY @ 127.0.0.1:44444`. Re-running it cleanly rebuilds (it stops the old server first, so the port frees up).
+
+The installer reads the server from [`toe/src/td_api.py`](src/td_api.py) on disk, so there is no second copy to drift. If you pasted it into the textport instead of dragging the file (so it has no `file` parameter to locate itself by), set `TOE_DIR_OVERRIDE` at the top of the script.
+
+To produce a distributable binary: after it reports READY, right-click `TouchAPI` → **Save Component .tox...** → save as `toe/TouchAPI.tox`, then verify the round-trip (§7) and commit. After that, others can skip the script and just drag the `.tox` in.
+
+---
+
+The rest of this document is the **manual recipe** — what `install.py` does, step by step. Read it to understand the component or to build it by hand.
 
 ## 1. Open TouchDesigner
 

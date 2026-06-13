@@ -47,18 +47,22 @@ Sixteen MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint ho
    /plugin install C:/path/to/Touch
    ```
    (Use the absolute path to your local clone of this repo. There is no marketplace listing.)
-2. Open a TouchDesigner project, then drag `toe/TouchAPI.tox` into the network (typically `/project1`).
+2. Open a TouchDesigner project, then drop the TouchAPI component into the network (typically `/project1`):
+   - **If you have a built `toe/TouchAPI.tox`** (you saved one previously, or got it from a release): drag it straight in. Done.
+   - **Otherwise** — drag `toe/install.py` into the network (TD makes a Text DAT from it), then right-click that DAT → **Run Script**. It builds the whole `TouchAPI` component, wires everything, and starts the server in one step. No Component Editor, no hand-set parameters. See [`toe/BUILD_TOX.md`](toe/BUILD_TOX.md) for what it does under the hood.
 3. Select the `TouchAPI` node and verify the `Status` custom parameter reads:
    ```
    READY @ 127.0.0.1:44444
    ```
    If it reads `stopped`, the server didn't bind — check TD's textport for Python errors.
 
-The first time you drop the .tox in, TD writes a fresh token to the config path above. The MCP server reads that same file on startup.
+The first time the component runs, TD writes a fresh token to the config path above. The MCP server reads that same file on startup.
+
+> **Want a one-drag binary for everyone else?** After `install.py` reports READY, right-click the `TouchAPI` COMP → **Save Component .tox...**, save it as `toe/TouchAPI.tox`, and commit it. From then on, anyone can skip the script and just drag the `.tox` in (step 2, first bullet).
 
 ## Usage examples
 
-Once the plugin is installed and the .tox is running, in Claude Code:
+Once the plugin is installed and the component is running, in Claude Code:
 
 - "Show me the current network."
 - "Add a noise TOP and wire it into the render."
@@ -100,9 +104,10 @@ Touch/
 ├── src/index.ts                 # MCP server + 9 tool wrappers (TS)
 ├── dist/index.js                # bundled output (built)
 ├── toe/
-│   ├── TouchAPI.tox             # TD component, built from toe/src/td_api.py
-│   ├── src/td_api.py            # authoritative Python server source
-│   └── BUILD_TOX.md             # how to rebuild the .tox from src
+│   ├── install.py              # one-shot in-TD builder for the TouchAPI component
+│   ├── TouchAPI.tox            # optional built binary (produce via Save Component .tox)
+│   ├── src/td_api.py           # authoritative Python server source
+│   └── BUILD_TOX.md            # install.py fast path + manual build recipe
 ├── tests/
 │   ├── api.test.ts              # TS client unit tests
 │   ├── python_api_test.py       # Python server unit tests
