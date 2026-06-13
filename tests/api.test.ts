@@ -49,6 +49,22 @@ beforeAll(async () => {
         return res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({path:"/geoA", name:"geoA", type:"geo"}));
       if (url.startsWith("/screenshot"))
         return res.writeHead(200, {"content-type":"image/png"}).end(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]));
+      if (url.startsWith("/chop"))
+        return res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({path:"/chop1", numChans:1, channels:[{name:"chan1", numSamples:4, samples:[0,1,2,3]}]}));
+      if (url.startsWith("/dat"))
+        return res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({path:"/table1", numRows:2, numCols:2, rows:[["a","b"],["c","d"]]}));
+      if (url.startsWith("/perf"))
+        return res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({path:"/", slowest:[]}));
+      if (url.startsWith("/connect"))
+        return res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({success:true, from:"/a", to:"/b"}));
+      if (url.startsWith("/disconnect"))
+        return res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({success:true, to:"/b"}));
+      if (url.startsWith("/delete"))
+        return res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({success:true, deleted:{name:"x"}}));
+      if (url.startsWith("/bind"))
+        return res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({success:true, mode:"expression"}));
+      if (url.startsWith("/layout"))
+        return res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({mode:"preview", target:"/project1", plan:[], broken_edges:[], overlaps:[], excluded:[], stats:{nodes:2}}));
       res.writeHead(404).end();
     });
   });
@@ -109,5 +125,71 @@ describe("td() client", () => {
     const call = calls.at(-1)!;
     expect(call.method).toBe("POST");
     expect(JSON.parse(call.body).type).toBe("geo");
+  });
+
+  it("chopTool forwards chan + samples as query params", async () => {
+    const { chopTool } = await import("../src/index.js");
+    calls.length = 0;
+    const out = await chopTool({ path: "/chop1", chan: "tx", samples: 8 });
+    const call = calls.at(-1)!;
+    expect(call.url).toContain("path=%2Fchop1");
+    expect(call.url).toContain("chan=tx");
+    expect(call.url).toContain("samples=8");
+    expect(out.content[0].text).toContain('"chan1"');
+  });
+
+  it("datTool reads a table", async () => {
+    const { datTool } = await import("../src/index.js");
+    const out = await datTool({ path: "/table1" });
+    expect(out.content[0].text).toContain('"numRows": 2');
+  });
+
+  it("perfTool defaults path to root", async () => {
+    const { perfTool } = await import("../src/index.js");
+    calls.length = 0;
+    await perfTool();
+    expect(calls.at(-1)!.url).toContain("path=%2F");
+  });
+
+  it("connectTool sends POST with from/to", async () => {
+    const { connectTool } = await import("../src/index.js");
+    calls.length = 0;
+    await connectTool({ from: "/a", to: "/b" });
+    const call = calls.at(-1)!;
+    expect(call.method).toBe("POST");
+    const sent = JSON.parse(call.body);
+    expect(sent.from).toBe("/a");
+    expect(sent.to).toBe("/b");
+  });
+
+  it("deleteTool sends POST with path", async () => {
+    const { deleteTool } = await import("../src/index.js");
+    calls.length = 0;
+    await deleteTool({ path: "/doomed" });
+    const call = calls.at(-1)!;
+    expect(call.method).toBe("POST");
+    expect(JSON.parse(call.body).path).toBe("/doomed");
+  });
+
+  it("bindTool sends expr and mode", async () => {
+    const { bindTool } = await import("../src/index.js");
+    calls.length = 0;
+    await bindTool({ path: "/geo1", param: "tx", expr: "op('lfo1')['chan1']" });
+    const call = calls.at(-1)!;
+    expect(call.method).toBe("POST");
+    expect(JSON.parse(call.body).expr).toBe("op('lfo1')['chan1']");
+  });
+
+  it("layoutTool POSTs path + options and previews by default", async () => {
+    const { layoutTool } = await import("../src/index.js");
+    calls.length = 0;
+    const out = await layoutTool({ path: "/project1", direction: "TB", exclude: ["TouchAPI"] });
+    const call = calls.at(-1)!;
+    expect(call.method).toBe("POST");
+    const sent = JSON.parse(call.body);
+    expect(sent.path).toBe("/project1");
+    expect(sent.direction).toBe("TB");
+    expect(sent.exclude).toEqual(["TouchAPI"]);
+    expect(out.content[0].text).toContain('"mode": "preview"');
   });
 });

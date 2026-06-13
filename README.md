@@ -4,11 +4,13 @@ A Claude Code plugin that exposes TouchDesigner to Claude via MCP: execute Pytho
 
 ## Status
 
-v0.1 — local-only install. Requires TouchDesigner 2025+ and Node 20+. Developed and tested on Windows 11. POSIX paths are handled but unverified end-to-end.
+v0.3 — local-only install. Requires TouchDesigner 2025+ and Node 20+. Developed and tested on Windows 11. POSIX paths are handled but unverified end-to-end.
+
+> **Upgrading from v0.1/v0.2:** rebuild the `TouchAPI` component — easiest via [`toe/install.py`](toe/install.py). v0.3 marshals every request onto TD's main cook thread (`bootstrap.onFrameStart` → `drain_main_queue`), which is required for safe op access; it also adds a `td_layout` DAT and the `ParMode` shim bridge. An older `.tox` that lacks the `onFrameStart` drain will accept requests but time them out.
 
 ## What it does
 
-Nine MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint hosted inside TouchDesigner:
+Seventeen MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint hosted inside TouchDesigner:
 
 | Tool | Description | Example prompt |
 |---|---|---|
@@ -21,6 +23,14 @@ Nine MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint hoste
 | `td_screenshot` | PNG of a TOP's current frame, returned as an inline image. | "Screenshot the `out1` render TOP." |
 | `td_graph` | Structured JSON subgraph: nodes + wires, to a given depth. | "Show me the graph under `/project1/comp1`." |
 | `td_create` | Create an operator of a given type under a parent, optionally wired to inputs. | "Add a `noiseTOP` and wire it into `render1`." |
+| `td_chop` | Sample channel data off a CHOP (downsampled, capped). | "What values is `audioanalysis1` outputting?" |
+| `td_dat` | Read a DAT's table cells and raw text. | "Dump the `table1` DAT." |
+| `td_perf` | Slowest-cooking operators under a path, by cook time. | "What's the slowest op in `/project1`?" |
+| `td_connect` | Wire one operator's output into another's input. | "Wire `blur1` into `comp1`'s second input." |
+| `td_disconnect` | Drop wires into an operator's input(s). | "Disconnect `comp1`'s inputs." |
+| `td_delete` | Destroy an operator. | "Delete `noise2`." |
+| `td_bind` | Bind a parameter to an expression (reactive) or constant. | "Drive `geo1.tx` off `op('lfo1')['chan1']`." |
+| `td_layout` | Auto-arrange a subnet (layered DAG / Sugiyama), untangling wire crossings. | "Tidy up the layout under `/project1`." |
 
 ## Security posture
 
@@ -38,18 +48,22 @@ Nine MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint hoste
    /plugin install C:/path/to/Touch
    ```
    (Use the absolute path to your local clone of this repo. There is no marketplace listing.)
-2. Open a TouchDesigner project, then drag `toe/TouchAPI.tox` into the network (typically `/project1`).
+2. Open a TouchDesigner project, then drop the TouchAPI component into the network (typically `/project1`):
+   - **If you have a built `toe/TouchAPI.tox`** (you saved one previously, or got it from a release): drag it straight in. Done.
+   - **Otherwise** — drag `toe/install.py` into the network (TD makes a Text DAT from it), then right-click that DAT → **Run Script**. It builds the whole `TouchAPI` component, wires everything, and starts the server in one step. No Component Editor, no hand-set parameters. See [`toe/BUILD_TOX.md`](toe/BUILD_TOX.md) for what it does under the hood.
 3. Select the `TouchAPI` node and verify the `Status` custom parameter reads:
    ```
    READY @ 127.0.0.1:44444
    ```
    If it reads `stopped`, the server didn't bind — check TD's textport for Python errors.
 
-The first time you drop the .tox in, TD writes a fresh token to the config path above. The MCP server reads that same file on startup.
+The first time the component runs, TD writes a fresh token to the config path above. The MCP server reads that same file on startup.
+
+> **Want a one-drag binary for everyone else?** After `install.py` reports READY, right-click the `TouchAPI` COMP → **Save Component .tox...**, save it as `toe/TouchAPI.tox`, and commit it. From then on, anyone can skip the script and just drag the `.tox` in (step 2, first bullet).
 
 ## Usage examples
 
-Once the plugin is installed and the .tox is running, in Claude Code:
+Once the plugin is installed and the component is running, in Claude Code:
 
 - "Show me the current network."
 - "Add a noise TOP and wire it into the render."
@@ -68,10 +82,10 @@ Clone, install, test, build:
 
 ```bash
 npm install
-npm run test        # 6 TS unit tests (client wrapper)
-python -m pytest tests/python_api_test.py   # 22 Python tests (server core)
+npm run test        # 13 TS unit tests (client wrapper)
+python -m pytest tests/python_api_test.py tests/layout_test.py   # 53 Python tests (server core + layout)
 npm run build       # bundles src/index.ts -> dist/index.js
-npm run smoke       # exercises 7 tools against a live TD (see tests/manual.md)
+npm run smoke       # exercises 9 tools against a live TD (see tests/manual.md)
 ```
 
 Regenerating the `.tox`: see [`toe/BUILD_TOX.md`](toe/BUILD_TOX.md). After rebuilding, audit the `.tox` with:
@@ -91,9 +105,11 @@ Touch/
 ├── src/index.ts                 # MCP server + 9 tool wrappers (TS)
 ├── dist/index.js                # bundled output (built)
 ├── toe/
-│   ├── TouchAPI.tox             # TD component, built from toe/src/td_api.py
-│   ├── src/td_api.py            # authoritative Python server source
-│   └── BUILD_TOX.md             # how to rebuild the .tox from src
+│   ├── install.py              # one-shot in-TD builder for the TouchAPI component
+│   ├── TouchAPI.tox            # optional built binary (produce via Save Component .tox)
+│   ├── src/td_api.py           # authoritative Python server source
+│   ├── src/td_layout.py        # pure-stdlib layered-DAG layout (no TD deps)
+│   └── BUILD_TOX.md            # install.py fast path + manual build recipe
 ├── tests/
 │   ├── api.test.ts              # TS client unit tests
 │   ├── python_api_test.py       # Python server unit tests

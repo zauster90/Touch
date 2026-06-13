@@ -128,12 +128,53 @@ export async function createTool(args: {
   }));
 }
 
+const postJson = (endpoint: string, body: unknown) =>
+  td(endpoint, { method: "POST", body: JSON.stringify(body), headers: { "Content-Type": "application/json" } });
+
+export async function chopTool({ path: p, chan, samples }: { path: string; chan?: string; samples?: number }) {
+  const q = new URLSearchParams({ path: p });
+  if (chan !== undefined) q.set("chan", chan);
+  if (samples !== undefined) q.set("samples", String(samples));
+  return asText(await td(`/chop?${q}`));
+}
+export async function datTool({ path: p, rows, cols }: { path: string; rows?: number; cols?: number }) {
+  const q = new URLSearchParams({ path: p });
+  if (rows !== undefined) q.set("rows", String(rows));
+  if (cols !== undefined) q.set("cols", String(cols));
+  return asText(await td(`/dat?${q}`));
+}
+export async function perfTool({ path: p, depth, top }: { path?: string; depth?: number; top?: number } = {}) {
+  const q = new URLSearchParams({ path: p ?? "/" });
+  if (depth !== undefined) q.set("depth", String(depth));
+  if (top !== undefined) q.set("top", String(top));
+  return asText(await td(`/perf?${q}`));
+}
+export async function connectTool(args: { from: string; to: string; inputIndex?: number; outputIndex?: number }) {
+  return asText(await postJson("/connect", args));
+}
+export async function disconnectTool(args: { to: string; inputIndex?: number }) {
+  return asText(await postJson("/disconnect", args));
+}
+export async function deleteTool(args: { path: string }) {
+  return asText(await postJson("/delete", args));
+}
+export async function bindTool(args: { path: string; param: string; expr?: string; mode?: string; val?: unknown }) {
+  return asText(await postJson("/bind", args));
+}
+export async function layoutTool(args: {
+  path: string; apply?: boolean; direction?: "LR" | "TB";
+  spacing?: { rank: number; node: number }; rank_gap?: number; node_gap?: number;
+  selection_only?: boolean; exclude?: string[];
+}) {
+  return asText(await postJson("/layout", args));
+}
+
 // ---------------------------------------------------------------------------
 // MCP server wiring
 // ---------------------------------------------------------------------------
 
 function buildServer(): McpServer {
-  const server = new McpServer({ name: "touch", version: "0.1.0" });
+  const server = new McpServer({ name: "touch", version: "0.3.0" });
 
   server.registerTool("td_execute", {
     title: "Execute Python in TouchDesigner",
@@ -194,6 +235,74 @@ function buildServer(): McpServer {
       inputs: z.array(z.string()).optional(),
     },
   }, createTool);
+
+  server.registerTool("td_chop", {
+    title: "Read CHOP channel data",
+    description: "Sample channels off a CHOP. Optional `chan` name filter and `samples` cap (default 16). See the actual numbers flowing through the network.",
+    inputSchema: { path: z.string(), chan: z.string().optional(), samples: z.number().optional() },
+  }, chopTool);
+
+  server.registerTool("td_dat", {
+    title: "Read DAT table contents",
+    description: "Read a DAT's cells (capped by `rows`/`cols`) plus its raw text.",
+    inputSchema: { path: z.string(), rows: z.number().optional(), cols: z.number().optional() },
+  }, datTool);
+
+  server.registerTool("td_perf", {
+    title: "Probe cook performance",
+    description: "Slowest-cooking operators under `path`, by last cook time (ms). Use to find what to optimize.",
+    inputSchema: { path: z.string().optional(), depth: z.number().optional(), top: z.number().optional() },
+  }, perfTool);
+
+  server.registerTool("td_connect", {
+    title: "Wire two operators",
+    description: "Connect `from` op's output into `to` op's input. Indices default to 0.",
+    inputSchema: {
+      from: z.string(),
+      to: z.string(),
+      inputIndex: z.number().optional(),
+      outputIndex: z.number().optional(),
+    },
+  }, connectTool);
+
+  server.registerTool("td_disconnect", {
+    title: "Remove operator wires",
+    description: "Drop wires into `to`. Omit `inputIndex` to clear all inputs.",
+    inputSchema: { to: z.string(), inputIndex: z.number().optional() },
+  }, disconnectTool);
+
+  server.registerTool("td_delete", {
+    title: "Delete an operator",
+    description: "Destroy the operator at `path`. Read the graph first — this is irreversible without TD undo.",
+    inputSchema: { path: z.string() },
+  }, deleteTool);
+
+  server.registerTool("td_bind", {
+    title: "Bind a parameter reactively",
+    description: "Make a parameter reactive. mode 'expression' (default) sets an expr like \"op('audio')['rms']\"; mode 'constant' sets a fixed `val`.",
+    inputSchema: {
+      path: z.string(),
+      param: z.string(),
+      expr: z.string().optional(),
+      mode: z.enum(["expression", "constant"]).optional(),
+      val: z.any().optional(),
+    },
+  }, bindTool);
+
+  server.registerTool("td_layout", {
+    title: "Auto-arrange a subnet",
+    description: "Layered DAG layout (Sugiyama) of the direct children of `path`. Reads wires + tile sizes and untangles crossings. Returns a preview `plan` by default; pass `apply: true` to write nodeX/nodeY. Use `exclude` (names/paths) or `selection_only` to scope it.",
+    inputSchema: {
+      path: z.string(),
+      apply: z.boolean().optional(),
+      direction: z.enum(["LR", "TB"]).optional(),
+      spacing: z.object({ rank: z.number(), node: z.number() }).optional(),
+      rank_gap: z.number().optional(),
+      node_gap: z.number().optional(),
+      selection_only: z.boolean().optional(),
+      exclude: z.array(z.string()).optional(),
+    },
+  }, layoutTool);
 
   return server;
 }

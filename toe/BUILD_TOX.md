@@ -2,7 +2,22 @@
 
 How to construct or rebuild the `TouchAPI` component from scratch in TouchDesigner using the authoritative source at [`toe/src/td_api.py`](src/td_api.py).
 
-The `.tox` is a binary TD component. It can't be generated from a script — TD's UI is the build tool. These steps are the build recipe.
+The `.tox` is a binary TD component. It can't be generated from a script *outside* TD — TD's UI is the build tool. But you don't have to assemble it by hand: an installer script automates every step below from inside TD.
+
+## Fast path: `install.py` (recommended)
+
+1. Drag [`toe/install.py`](install.py) into a TD network (TD creates a Text DAT from it).
+2. Right-click that DAT → **Run Script**.
+
+It creates `/project1/TouchAPI`, adds the four DATs (`td_api_src`, `td_layout`, `td_runtime_shim`, `bootstrap`) plus the `param_exec` token-rotation callback and the custom parameters, then starts the server — the `Status` parameter should read `READY @ 127.0.0.1:44444`. Re-running it cleanly rebuilds (it stops the old server first, so the port frees up).
+
+The installer reads `td_api.py` and `td_layout.py` from [`toe/src/`](src/) on disk, so there is no second copy to drift. If you pasted it into the textport instead of dragging the file (so it has no `file` parameter to locate itself by), set `TOE_DIR_OVERRIDE` at the top of the script.
+
+To produce a distributable binary: after it reports READY, right-click `TouchAPI` → **Save Component .tox...** → save as `toe/TouchAPI.tox`, then verify the round-trip (§7) and commit. After that, others can skip the script and just drag the `.tox` in.
+
+---
+
+The rest of this document is the **manual recipe** — what `install.py` does, step by step. Read it to understand the component or to build it by hand.
 
 ## 1. Open TouchDesigner
 
@@ -14,7 +29,7 @@ Launch TD 2025 or newer. Create a new, empty project. Work inside `/project1`.
 - Rename it to `TouchAPI`. The final path will be `/project1/TouchAPI`.
 - Dive inside it (`i`).
 
-## 3. Add the three DATs
+## 3. Add the DATs
 
 Inside `/project1/TouchAPI`:
 
@@ -25,7 +40,14 @@ Inside `/project1/TouchAPI`:
 - Open the DAT and paste the full contents of `toe/src/td_api.py`.
 - Save. Do not hand-edit this DAT after this point — always edit `toe/src/td_api.py` in-repo and re-sync.
 
-### 3b. `td_runtime_shim` — Text DAT (runtime bridge)
+### 3b. `td_layout` — Text DAT (layout engine)
+
+- `Tab` → **Text DAT**. Rename to `td_layout`.
+- Set **Language** to `Python`.
+- Paste the full contents of `toe/src/td_layout.py`. It is pure stdlib (no TD imports) and is imported by `td_api_src`'s `/layout` endpoint.
+- Like `td_api_src`, treat this DAT as read-only — edit `toe/src/td_layout.py` in-repo and re-sync.
+
+### 3c. `td_runtime_shim` — Text DAT (runtime bridge)
 
 - `Tab` → **Text DAT**. Rename to `td_runtime_shim`.
 - Set **Language** to `Python`.
@@ -38,18 +60,25 @@ Inside `/project1/TouchAPI`:
   m.op = op
   m.ops = ops
   m.ui = ui
+  m.ParMode = ParMode  # needed by /bind to switch a parameter to expression mode
   sys.modules["td_runtime"] = m
   ```
+  > If you built the `.tox` against an older shim that did not bridge `ParMode`,
+  > `td_bind` still writes the expr/val but leaves the parameter's mode unchanged.
+  > Re-paste this shim and resave to get the mode switch.
 - Right-click the DAT → **Run Script**. This must run once before `td_api_src` is imported; the `bootstrap` Execute DAT (below) re-runs it on project start.
 
-### 3c. `bootstrap` — Execute DAT (lifecycle)
+### 3d. `bootstrap` — Execute DAT (lifecycle)
 
 - `Tab` → **Execute DAT**. Rename to `bootstrap`.
-- On the DAT's parameters, turn on **Start** and **Exit** callbacks.
+- On the DAT's parameters, turn on **Start**, **Exit**, and **Frame Start** callbacks.
 - Replace the body with:
   ```python
+  import sys
+
   def onStart():
       op('td_runtime_shim').run()
+      sys.modules['td_layout'] = mod('td_layout')
       mod('td_api_src').start_server()
       parent().par.Status = f"READY @ 127.0.0.1:{parent().par.Port.eval()}"
 
@@ -58,8 +87,28 @@ Inside `/project1/TouchAPI`:
           mod('td_api_src').stop_server()
       finally:
           parent().par.Status = "stopped"
+
+  def onFrameStart(frame):
+      mod('td_api_src').drain_main_queue()
   ```
   `mod('td_api_src')` accesses a Python Text DAT as a module (TD's DAT-as-module feature).
+
+  **Why `onFrameStart` matters:** TD's Python API (`op()`, `ui.*`, parameter
+  access) is only safe on the main cook thread. The HTTP server runs request
+  handlers on worker threads, so every endpoint is marshalled onto a queue and
+  executed here, once per frame, on the main thread. Without this callback the
+  server accepts requests but every one of them times out after 5s — and any
+  endpoint that touched an op from the worker thread could wedge TD. Don't skip it.
+
+### 3e. `param_exec` — Parameter Execute DAT (token rotation)
+
+- `Tab` → **Parameter Execute DAT**. Rename to `param_exec`.
+- Set its `OP` parameter to `..` (the `TouchAPI` COMP) and turn on the **Pulse** and **Custom** toggles so it fires for the custom `Rotate` pulse.
+- Replace the body with:
+  ```python
+  def onPulse(par):
+      mod('td_api_src').rotate_token()
+  ```
 
 ## 4. Custom parameters on `TouchAPI`
 
@@ -69,7 +118,7 @@ Exit back into `/project1`, select `TouchAPI`, open the **Component Editor** (ri
 |---|---|---|---|
 | `Port` | Int | `44444` | Read-only. Shown for reference; server port is currently hardcoded in `td_api.py`. |
 | `Status` | Str | `stopped` | Display-only (set `Enable: Off` on the parameter so users can't edit). Populated by `bootstrap.onStart`. |
-| `Rotate` | Pulse | — | Button. On the parameter's `Pulse` callback, add: `mod('td_api_src').rotate_token()`. |
+| `Rotate` | Pulse | — | Button. Handled by the `param_exec` Parameter Execute DAT (step 3e), which calls `mod('td_api_src').rotate_token()`. |
 
 You can also drive the parameters from a script by selecting `TouchAPI` and running in the textport:
 ```python
