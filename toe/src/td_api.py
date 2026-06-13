@@ -467,3 +467,212 @@ def _screenshot(ctx: Ctx):
         except OSError:
             pass
     return 200, ("image/png", data)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — data readback (CHOP / DAT) and performance
+# ---------------------------------------------------------------------------
+
+@route("GET", "/chop")
+def _chop(ctx: Ctx):
+    """Sample channel data off a CHOP. Optionally filter by `chan` name pattern
+    and cap returned samples per channel with `samples` (default 16, max 600)."""
+    td = _td()
+    path = ctx.q("path")
+    if not path:
+        return 400, {"error": {"type": "BadInput", "message": "path required"}}
+    o = td.op(path)
+    if o is None:
+        return 404, {"error": {"type": "NotFound", "message": path}}
+    if not hasattr(o, "chans"):
+        return 400, {"error": {"type": "BadOp", "message": "not a CHOP (no .chans)"}}
+    try:
+        max_samples = int(ctx.q("samples", "16") or "16")
+    except ValueError:
+        return 400, {"error": {"type": "BadInput", "message": "samples must be integer"}}
+    max_samples = max(1, min(max_samples, 600))
+    pattern = ctx.q("chan")
+    chans = o.chans(pattern) if pattern else o.chans()
+    out: list[dict] = []
+    for c in chans:
+        vals = list(getattr(c, "vals", []) or [])
+        total = len(vals)
+        truncated = total > max_samples
+        if truncated:
+            # Even stride downsample so the shape survives the cap.
+            step = total / max_samples
+            vals = [vals[int(i * step)] for i in range(max_samples)]
+        out.append({
+            "name": getattr(c, "name", None),
+            "numSamples": total,
+            "truncated": truncated,
+            "samples": vals,
+        })
+    return 200, {"path": path, "numChans": len(out), "channels": out}
+
+
+@route("GET", "/dat")
+def _dat(ctx: Ctx):
+    """Read a DAT's table cells (capped by `rows`/`cols`) plus its raw `text`."""
+    td = _td()
+    path = ctx.q("path")
+    if not path:
+        return 400, {"error": {"type": "BadInput", "message": "path required"}}
+    o = td.op(path)
+    if o is None:
+        return 404, {"error": {"type": "NotFound", "message": path}}
+    if not hasattr(o, "numRows"):
+        return 400, {"error": {"type": "BadOp", "message": "not a DAT (no .numRows)"}}
+    try:
+        max_rows = int(ctx.q("rows", "50") or "50")
+        max_cols = int(ctx.q("cols", "20") or "20")
+    except ValueError:
+        return 400, {"error": {"type": "BadInput", "message": "rows/cols must be integer"}}
+    nrows, ncols = o.numRows, o.numCols
+    rows: list[list[str]] = []
+    for r in range(min(nrows, max(0, max_rows))):
+        row: list[str] = []
+        for c in range(min(ncols, max(0, max_cols))):
+            cell = o[r, c]
+            row.append(cell.val if hasattr(cell, "val") else ("" if cell is None else str(cell)))
+        rows.append(row)
+    return 200, {
+        "path": path,
+        "numRows": nrows,
+        "numCols": ncols,
+        "truncated": nrows > max_rows or ncols > max_cols,
+        "rows": rows,
+        "text": getattr(o, "text", None),
+    }
+
+
+@route("GET", "/perf")
+def _perf(ctx: Ctx):
+    """Slowest-cooking operators under `path`, descending by last cook time (ms)."""
+    td = _td()
+    path = ctx.q("path", "/") or "/"
+    root = td.op(path)
+    if root is None:
+        return 404, {"error": {"type": "NotFound", "message": path}}
+    try:
+        depth = int(ctx.q("depth", "10") or "10")
+        top_n = int(ctx.q("top", "10") or "10")
+    except ValueError:
+        return 400, {"error": {"type": "BadInput", "message": "depth/top must be integer"}}
+    rows: list[dict] = []
+    for n in [root, *root.findChildren(depth=depth)]:
+        ct = getattr(n, "cookTime", None)
+        if ct is None:
+            continue
+        rows.append({**_op_info(n), "cookTime": ct, "totalCooks": getattr(n, "totalCooks", None)})
+    rows.sort(key=lambda r: r["cookTime"] or 0, reverse=True)
+    return 200, {"path": path, "depth": depth, "count": len(rows), "slowest": rows[:max(1, top_n)]}
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — wiring & lifecycle
+# ---------------------------------------------------------------------------
+
+@route("POST", "/connect")
+def _connect(ctx: Ctx):
+    """Wire `from` op's output into `to` op's input. Indices default to 0."""
+    td = _td()
+    data = ctx.json() or {}
+    src, dst = data.get("from"), data.get("to")
+    if not src or not dst:
+        return 400, {"error": {"type": "BadInput", "message": "from and to required"}}
+    try:
+        out_idx = int(data.get("outputIndex", 0) or 0)
+        in_idx = int(data.get("inputIndex", 0) or 0)
+    except (TypeError, ValueError):
+        return 400, {"error": {"type": "BadInput", "message": "indices must be integers"}}
+    s, d = td.op(src), td.op(dst)
+    if s is None:
+        return 404, {"error": {"type": "NotFound", "message": src}}
+    if d is None:
+        return 404, {"error": {"type": "NotFound", "message": dst}}
+    try:
+        d.inputConnectors[in_idx].connect(s.outputConnectors[out_idx])
+    except Exception as exc:  # noqa: BLE001
+        return 200, {"success": False, "error": {"type": type(exc).__name__, "message": str(exc)}}
+    return 200, {"success": True, "from": src, "to": dst, "inputIndex": in_idx, "outputIndex": out_idx}
+
+
+@route("POST", "/disconnect")
+def _disconnect(ctx: Ctx):
+    """Drop wires into `to`. Omit `inputIndex` to clear all inputs."""
+    td = _td()
+    data = ctx.json() or {}
+    dst = data.get("to")
+    if not dst:
+        return 400, {"error": {"type": "BadInput", "message": "to required"}}
+    d = td.op(dst)
+    if d is None:
+        return 404, {"error": {"type": "NotFound", "message": dst}}
+    in_idx = data.get("inputIndex")
+    try:
+        if in_idx is None:
+            for ic in d.inputConnectors:
+                ic.disconnect()
+        else:
+            d.inputConnectors[int(in_idx)].disconnect()
+    except Exception as exc:  # noqa: BLE001
+        return 200, {"success": False, "error": {"type": type(exc).__name__, "message": str(exc)}}
+    return 200, {"success": True, "to": dst, "inputIndex": in_idx}
+
+
+@route("POST", "/delete")
+def _delete(ctx: Ctx):
+    """Destroy the operator at `path`."""
+    td = _td()
+    data = ctx.json() or {}
+    path = data.get("path")
+    if not path:
+        return 400, {"error": {"type": "BadInput", "message": "path required"}}
+    o = td.op(path)
+    if o is None:
+        return 404, {"error": {"type": "NotFound", "message": path}}
+    if not hasattr(o, "destroy"):
+        return 400, {"error": {"type": "BadOp", "message": "op has no destroy()"}}
+    info = _op_info(o)
+    o.destroy()
+    return 200, {"success": True, "deleted": info}
+
+
+@route("POST", "/bind")
+def _bind(ctx: Ctx):
+    """Bind a parameter reactively. `mode` = "expression" (default) sets
+    `param.expr` (e.g. "op('audio')['rms']"); "constant" sets a fixed `val`.
+    ParMode is bridged through td_runtime; if absent the value/expr is still
+    written and the mode left untouched."""
+    td = _td()
+    data = ctx.json() or {}
+    path, param = data.get("path"), data.get("param")
+    if not path or not param:
+        return 400, {"error": {"type": "BadInput", "message": "path and param required"}}
+    o = td.op(path)
+    if o is None:
+        return 404, {"error": {"type": "NotFound", "message": path}}
+    par = getattr(o.par, param, None)
+    if par is None:
+        return 404, {"error": {"type": "NotFound", "message": f"{path}.par.{param}"}}
+    mode = (data.get("mode") or "expression").lower()
+    par_mode = getattr(td, "ParMode", None)
+    expr = data.get("expr")
+    try:
+        if mode == "constant":
+            if "val" in data:
+                par.val = data["val"]
+            if par_mode is not None:
+                par.mode = par_mode.CONSTANT
+        elif mode == "expression":
+            if expr is None:
+                return 400, {"error": {"type": "BadInput", "message": "expr required for expression mode"}}
+            par.expr = expr
+            if par_mode is not None:
+                par.mode = par_mode.EXPRESSION
+        else:
+            return 400, {"error": {"type": "BadInput", "message": f"unknown mode: {mode}"}}
+    except Exception as exc:  # noqa: BLE001
+        return 200, {"success": False, "error": {"type": type(exc).__name__, "message": str(exc)}}
+    return 200, {"success": True, "path": path, "param": param, "mode": mode, "expr": expr}

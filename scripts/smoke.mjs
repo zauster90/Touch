@@ -9,6 +9,7 @@ const checks = [
   ["td_errors", () => api.errorsTool()],
   ["td_params (read)", () => api.paramsTool({ path: "/" })],
   ["td_graph", () => api.graphTool({ path: "/", depth: 1 })],
+  ["td_perf", () => api.perfTool({ path: "/", depth: 2 })],
   ["td_execute", () => api.executeTool({ code: "print('smoke ok')" })],
 ];
 

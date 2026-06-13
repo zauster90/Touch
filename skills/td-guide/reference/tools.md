@@ -1,8 +1,8 @@
 # Tools
 
-Which of the 9 Touch MCP tools to reach for, and in what order. The heuristic: **read before write, structured before scripted, verify after every batch.**
+Which of the 16 Touch MCP tools to reach for, and in what order. The heuristic: **read before write, structured before scripted, verify after every batch.**
 
-## The 9 tools at a glance
+## The 16 tools at a glance
 
 | Tool | Purpose | Mutates? |
 |------|---------|----------|
@@ -11,10 +11,41 @@ Which of the 9 Touch MCP tools to reach for, and in what order. The heuristic: *
 | `td_graph` | Walk the node graph from a path | read |
 | `td_operators` | List ops in a path / filter by family | read |
 | `td_params` | Read **or** write parameters on an op | both |
+| `td_chop` | Sample channel values off a CHOP | read |
+| `td_dat` | Read a DAT's table cells + raw text | read |
+| `td_perf` | Slowest-cooking ops by cook time | read |
 | `td_errors` | Compile/runtime errors surfaced by TD | read |
 | `td_screenshot` | Grab image from a TOP | read |
 | `td_create` | Create a new op (with inputs + params) | write |
+| `td_connect` | Wire one op's output into another's input | write |
+| `td_disconnect` | Drop wires into an op's input(s) | write |
+| `td_delete` | Destroy an op | write |
+| `td_bind` | Bind a parameter to an expression / constant | write |
 | `td_execute` | Run arbitrary Python in TD | write (arbitrary) |
+
+## Seeing the data, not just the graph
+
+`td_graph` shows you *topology*; it does not show you the numbers moving through it. When a network is wired correctly but the output is wrong, the bug is almost always in the data:
+
+- **`td_chop`** — read the actual channel values. Is `audioanalysis1` outputting zeros? Is the LFO in the range you expect? This is the CHOP equivalent of `td_screenshot` for TOPs.
+- **`td_dat`** — read table/text DAT contents (instance data, OSC tables, config).
+- **`td_perf`** — when the project is dropping frames, find the operator eating the cook budget before you start guessing.
+
+## Reactivity: `td_bind` vs `td_params`
+
+`td_params` sets a **static** value. `td_bind` makes a parameter **reactive**:
+
+- `mode: "expression"` (default) sets `param.expr`, e.g. `op('audio1')['rms']` to drive a value off a channel, or `absTime.seconds * 0.1` for time-based motion. This is the idiomatic TD way to link parameters to signals.
+- `mode: "constant"` sets a fixed `val` and forces the parameter back to constant mode (use to *un*-bind).
+
+Reach for `td_bind` whenever the intent is "make X follow Y" rather than "set X to a number".
+
+## Editing existing networks
+
+`td_create` wires on creation, but to refactor what's already there:
+
+- **`td_connect` / `td_disconnect`** — rewire without recreating ops. `inputIndex` selects which input (0-based); omit it on disconnect to clear all inputs.
+- **`td_delete`** — destroy an op. Irreversible from the API (TD's in-app Undo still covers it). Always `td_graph` first so you know what feeds the op you're about to remove.
 
 ## Hierarchy of preference for mutation
 

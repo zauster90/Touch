@@ -38,8 +38,12 @@ Inside `/project1/TouchAPI`:
   m.op = op
   m.ops = ops
   m.ui = ui
+  m.ParMode = ParMode  # needed by /bind to switch a parameter to expression mode
   sys.modules["td_runtime"] = m
   ```
+  > If you built the `.tox` against an older shim that did not bridge `ParMode`,
+  > `td_bind` still writes the expr/val but leaves the parameter's mode unchanged.
+  > Re-paste this shim and resave to get the mode switch.
 - Right-click the DAT → **Run Script**. This must run once before `td_api_src` is imported; the `bootstrap` Execute DAT (below) re-runs it on project start.
 
 ### 3c. `bootstrap` — Execute DAT (lifecycle)

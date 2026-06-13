@@ -4,11 +4,13 @@ A Claude Code plugin that exposes TouchDesigner to Claude via MCP: execute Pytho
 
 ## Status
 
-v0.1 — local-only install. Requires TouchDesigner 2025+ and Node 20+. Developed and tested on Windows 11. POSIX paths are handled but unverified end-to-end.
+v0.2 — local-only install. Requires TouchDesigner 2025+ and Node 20+. Developed and tested on Windows 11. POSIX paths are handled but unverified end-to-end.
+
+> **Upgrading from v0.1:** the new `td_bind` tool needs the `td_runtime` shim to bridge `ParMode`. Rebuild `TouchAPI.tox` with the updated shim in [`toe/BUILD_TOX.md`](toe/BUILD_TOX.md). The other six new tools work against the existing `.tox` once `toe/src/td_api.py` is re-synced into it.
 
 ## What it does
 
-Nine MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint hosted inside TouchDesigner:
+Sixteen MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint hosted inside TouchDesigner:
 
 | Tool | Description | Example prompt |
 |---|---|---|
@@ -21,6 +23,13 @@ Nine MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint hoste
 | `td_screenshot` | PNG of a TOP's current frame, returned as an inline image. | "Screenshot the `out1` render TOP." |
 | `td_graph` | Structured JSON subgraph: nodes + wires, to a given depth. | "Show me the graph under `/project1/comp1`." |
 | `td_create` | Create an operator of a given type under a parent, optionally wired to inputs. | "Add a `noiseTOP` and wire it into `render1`." |
+| `td_chop` | Sample channel data off a CHOP (downsampled, capped). | "What values is `audioanalysis1` outputting?" |
+| `td_dat` | Read a DAT's table cells and raw text. | "Dump the `table1` DAT." |
+| `td_perf` | Slowest-cooking operators under a path, by cook time. | "What's the slowest op in `/project1`?" |
+| `td_connect` | Wire one operator's output into another's input. | "Wire `blur1` into `comp1`'s second input." |
+| `td_disconnect` | Drop wires into an operator's input(s). | "Disconnect `comp1`'s inputs." |
+| `td_delete` | Destroy an operator. | "Delete `noise2`." |
+| `td_bind` | Bind a parameter to an expression (reactive) or constant. | "Drive `geo1.tx` off `op('lfo1')['chan1']`." |
 
 ## Security posture
 
@@ -68,10 +77,10 @@ Clone, install, test, build:
 
 ```bash
 npm install
-npm run test        # 6 TS unit tests (client wrapper)
-python -m pytest tests/python_api_test.py   # 22 Python tests (server core)
+npm run test        # 12 TS unit tests (client wrapper)
+python -m pytest tests/python_api_test.py   # 36 Python tests (server core)
 npm run build       # bundles src/index.ts -> dist/index.js
-npm run smoke       # exercises 7 tools against a live TD (see tests/manual.md)
+npm run smoke       # exercises 8 tools against a live TD (see tests/manual.md)
 ```
 
 Regenerating the `.tox`: see [`toe/BUILD_TOX.md`](toe/BUILD_TOX.md). After rebuilding, audit the `.tox` with:

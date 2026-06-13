@@ -17,9 +17,11 @@ _stub = types.ModuleType("td_runtime")
 
 
 class _FakePar:
-    """Stand-in for a TD parameter. Has .val (mutable) and .eval (property)."""
+    """Stand-in for a TD parameter. Has .val (mutable), .eval, .expr, .mode."""
     def __init__(self, val):
         self.val = val
+        self.expr = ""
+        self.mode = None
     @property
     def eval(self):
         return self.val
@@ -50,6 +52,32 @@ class _FakeParGroup:
         return [n for n in self._pars.keys() if not n.startswith("_")]
 
 
+class _FakeChan:
+    """Stand-in for a CHOP channel — has a name and a list of sample values."""
+    def __init__(self, name, vals):
+        self.name = name
+        self.vals = list(vals)
+
+
+class _FakeCell:
+    """Stand-in for a DAT cell — has a .val string."""
+    def __init__(self, val):
+        self.val = val
+
+
+class _FakeConnector:
+    """Stand-in for an input/output connector."""
+    def __init__(self, owner):
+        self.owner = owner
+        self.connections: list = []
+
+    def connect(self, other):
+        self.connections.append(other)
+
+    def disconnect(self, other=None):
+        self.connections.clear()
+
+
 class _FakeOp:
     def __init__(self, path="/", name="root", type_="root", family="COMP"):
         self.path = path
@@ -59,10 +87,20 @@ class _FakeOp:
         self._children: list["_FakeOp"] = []
         self.par = _FakeParGroup({"tx": 0, "ty": 0})
         self.selected = False
-        self.inputConnectors: list = []
-        self.outputConnectors: list = []
+        self.inputConnectors: list = [_FakeConnector(self)]
+        self.outputConnectors: list = [_FakeConnector(self)]
         self.nodeX = 0
         self.nodeY = 0
+        # CHOP-like data
+        self._chans = [_FakeChan("chan1", [0.0, 1.0, 2.0, 3.0])]
+        # DAT-like data (2x2 grid)
+        self.numRows = 2
+        self.numCols = 2
+        self.text = "a\tb\nc\td"
+        # perf
+        self.cookTime = 0.5
+        self.totalCooks = 10
+        self.destroyed = False
 
     def findChildren(self, depth=1):
         out = list(self._children)
@@ -73,6 +111,19 @@ class _FakeOp:
 
     def errors(self): return ""
     def warnings(self): return ""
+
+    def chans(self, pattern=None):
+        if pattern:
+            return [c for c in self._chans if c.name == pattern]
+        return list(self._chans)
+
+    def __getitem__(self, key):
+        r, c = key
+        return _FakeCell(f"r{r}c{c}")
+
+    def destroy(self):
+        self.destroyed = True
+        _op_registry.pop(self.path, None)
 
     def create(self, type_, name=None):
         child_name = name or type_
@@ -104,6 +155,8 @@ _stub.op = _stub_op
 _stub.ui = types.SimpleNamespace(panes=types.SimpleNamespace(current=types.SimpleNamespace(
     owner=_stub_op("/"), x=0, y=0, zoom=1.0)))
 _stub.ops = lambda *args: []
+_stub.ParMode = types.SimpleNamespace(
+    EXPRESSION="EXPRESSION", CONSTANT="CONSTANT", EXPORT="EXPORT", BIND="BIND")
 sys.modules["td_runtime"] = _stub
 
 # Add toe/src to path so we can import td_api.
@@ -315,6 +368,129 @@ class ServerTest(unittest.TestCase):
     def test_screenshot_missing_path_returns_400(self):
         status, _ = self._req("/screenshot", token=self.token)
         self.assertEqual(status, 400)
+
+    # --- data readback ---
+    def test_chop_returns_channels(self):
+        status, body = self._req("/chop?path=/chop1", token=self.token)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["numChans"], 1)
+        self.assertEqual(data["channels"][0]["name"], "chan1")
+        self.assertEqual(data["channels"][0]["samples"], [0.0, 1.0, 2.0, 3.0])
+
+    def test_chop_downsamples_to_cap(self):
+        status, body = self._req("/chop?path=/chop1&samples=2", token=self.token)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        ch = data["channels"][0]
+        self.assertTrue(ch["truncated"])
+        self.assertEqual(len(ch["samples"]), 2)
+        self.assertEqual(ch["numSamples"], 4)
+
+    def test_chop_missing_path_returns_400(self):
+        status, _ = self._req("/chop", token=self.token)
+        self.assertEqual(status, 400)
+
+    def test_dat_returns_table(self):
+        status, body = self._req("/dat?path=/table1", token=self.token)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["numRows"], 2)
+        self.assertEqual(data["numCols"], 2)
+        self.assertEqual(data["rows"][0][0], "r0c0")
+        self.assertEqual(data["rows"][1][1], "r1c1")
+
+    def test_dat_caps_rows(self):
+        status, body = self._req("/dat?path=/table1&rows=1", token=self.token)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(len(data["rows"]), 1)
+        self.assertTrue(data["truncated"])
+
+    def test_perf_returns_slowest(self):
+        status, body = self._req("/perf?path=/", token=self.token)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertIn("slowest", data)
+        self.assertIsInstance(data["slowest"], list)
+        self.assertTrue(all("cookTime" in r for r in data["slowest"]))
+
+    # --- wiring & lifecycle ---
+    def test_connect(self):
+        payload = {"from": "/srcOp", "to": "/dstOp"}
+        status, body = self._req(
+            "/connect", token=self.token, method="POST",
+            body=json.dumps(payload),
+            headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["success"])
+        self.assertEqual(data["from"], "/srcOp")
+        self.assertEqual(data["to"], "/dstOp")
+
+    def test_connect_missing_fields_returns_400(self):
+        status, _ = self._req(
+            "/connect", token=self.token, method="POST",
+            body=json.dumps({"from": "/a"}),
+            headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 400)
+
+    def test_disconnect(self):
+        status, body = self._req(
+            "/disconnect", token=self.token, method="POST",
+            body=json.dumps({"to": "/dstOp"}),
+            headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["success"])
+
+    def test_delete(self):
+        # Create then delete.
+        self._req("/create", token=self.token, method="POST",
+                  body=json.dumps({"type": "null", "parent": "/", "name": "doomed"}),
+                  headers={"Content-Type": "application/json"})
+        status, body = self._req(
+            "/delete", token=self.token, method="POST",
+            body=json.dumps({"path": "/doomed"}),
+            headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["success"])
+        self.assertEqual(data["deleted"]["name"], "doomed")
+
+    def test_delete_missing_path_returns_400(self):
+        status, _ = self._req(
+            "/delete", token=self.token, method="POST",
+            body=json.dumps({}),
+            headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 400)
+
+    def test_bind_expression(self):
+        status, body = self._req(
+            "/bind", token=self.token, method="POST",
+            body=json.dumps({"path": "/bindme", "param": "tx", "expr": "op('lfo1')['chan1']"}),
+            headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["success"])
+        self.assertEqual(data["mode"], "expression")
+        # Verify the expr + mode landed on the fake parameter.
+        par = td_api._td().op("/bindme").par.tx
+        self.assertEqual(par.expr, "op('lfo1')['chan1']")
+        self.assertEqual(par.mode, "EXPRESSION")
+
+    def test_bind_expression_missing_expr_returns_400(self):
+        status, _ = self._req(
+            "/bind", token=self.token, method="POST",
+            body=json.dumps({"path": "/bindme", "param": "tx"}),
+            headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 400)
+
+    def test_bind_unknown_param_returns_404(self):
+        status, _ = self._req(
+            "/bind", token=self.token, method="POST",
+            body=json.dumps({"path": "/bindme", "param": "nope", "expr": "1"}),
+            headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 404)
 
 
 if __name__ == "__main__":
