@@ -37,6 +37,13 @@ m.op = op
 m.ops = ops
 m.ui = ui
 m.ParMode = ParMode  # needed by /bind to switch a parameter to expression mode
+# Optional globals used by /types, /project and /execute. eval() so a TD build
+# that lacks one still loads the shim.
+for _n in ("families", "project", "app", "absTime", "tdu"):
+    try:
+        setattr(m, _n, eval(_n))
+    except NameError:
+        pass
 sys.modules["td_runtime"] = m
 '''
 

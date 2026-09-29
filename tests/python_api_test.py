@@ -21,8 +21,14 @@ class _FakePar:
     def __init__(self, name, val):
         self.name = name
         self.val = val
+        self.default = val
         self.expr = ""
         self.mode = None
+        self.isPulse = False
+        self.pulses = 0
+
+    def pulse(self):
+        self.pulses += 1
 
     def eval(self):
         return self.val
@@ -104,6 +110,11 @@ class _FakeOp:
         self.cookTime = 0.5
         self.totalCooks = 10
         self.destroyed = False
+        self.customPages: list = []
+        self.bypass = self.display = self.render = self.lock = False
+        self.comment = ""
+        self.color = (0.5, 0.5, 0.5)
+        self.time = types.SimpleNamespace(frame=1.0, seconds=0.0, play=True, rate=60.0, start=1, end=600)
 
     def findChildren(self, depth=1):
         out = list(self._children)
@@ -145,6 +156,56 @@ class _FakeOp:
         # Minimal PNG signature + padding so test_screenshot_png can detect it.
         Path(filepath).write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
 
+    def parent(self):
+        head = self.path.rsplit("/", 1)[0] or "/"
+        return _stub_op(head)
+
+    def copy(self, src, name=None):
+        return self.create(src.type, name=name or f"{src.name}1")
+
+    # DAT-ish writes
+    def clear(self):
+        self.written_rows = []
+        self.numRows = 0
+
+    def appendRow(self, row):
+        self.written_rows = getattr(self, "written_rows", [])
+        self.written_rows.append(list(row))
+        self.numRows = len(self.written_rows)
+        self.numCols = max(self.numCols, len(row))
+
+    # COMP custom pages
+    def appendCustomPage(self, name):
+        page = _FakePage(self, name)
+        self.customPages.append(page)
+        return page
+
+
+class _FakePage:
+    """Stand-in for a custom parameter page — appendX(name, ...) adds pars."""
+    def __init__(self, owner, name):
+        self.owner = owner
+        self.name = name
+        self.pars: list = []
+
+    def __getattr__(self, attr):
+        if not attr.startswith("append"):
+            raise AttributeError(attr)
+        style = attr[len("append"):]
+
+        def append(name, label=None, size=1, replace=True):
+            suffixes = {"RGB": "rgb", "XYZ": "xyz", "XY": "xy"}.get(style)
+            names = [name + c for c in suffixes] if suffixes else [name]
+            made = []
+            for n in names:
+                self.owner.par.__setattr__(n, 0)
+                par = getattr(self.owner.par, n)
+                par.style = style
+                made.append(par)
+                self.pars.append(par)
+            return made
+        return append
+
 
 # Registry so repeated op(path) calls return the same instance.
 _op_registry: dict[str, _FakeOp] = {}
@@ -163,6 +224,13 @@ _stub.ui = types.SimpleNamespace(panes=types.SimpleNamespace(current=types.Simpl
 _stub.ops = lambda *args: []
 _stub.ParMode = types.SimpleNamespace(
     EXPRESSION="EXPRESSION", CONSTANT="CONSTANT", EXPORT="EXPORT", BIND="BIND")
+_stub.families = {
+    "TOP": [type("noiseTOP", (), {}), type("levelTOP", (), {})],
+    "CHOP": [type("lfoCHOP", (), {}), type("noiseCHOP", (), {})],
+}
+_stub.project = types.SimpleNamespace(name="test.toe", folder="/tmp", cookRate=60, saved=None)
+_stub.project.save = lambda path=None: setattr(_stub.project, "saved", path or "in-place")
+_stub.app = types.SimpleNamespace(version="2025.30000", build="30000", osName="Linux")
 sys.modules["td_runtime"] = _stub
 
 # Add toe/src to path so we can import td_api.
@@ -567,6 +635,225 @@ class ServerTest(unittest.TestCase):
         status, body = self._post("/layout", {"path": "/empty1"})
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["plan"], [])
+
+    # --- v0.4: execute ---
+    def test_execute_returns_last_expression(self):
+        status, body = self._req("/execute", token=self.token, method="POST",
+                                 body="x = 20\nx + 22")
+        data = json.loads(body)
+        self.assertTrue(data["success"])
+        self.assertEqual(data["result"], 42)
+
+    def test_execute_op_result_becomes_path(self):
+        _, body = self._req("/execute", token=self.token, method="POST", body="op('/exec_res')")
+        self.assertEqual(json.loads(body)["result"], "/exec_res")
+
+    def test_execute_error_reports_line(self):
+        _, body = self._req("/execute", token=self.token, method="POST",
+                            body="a = 1\nb = 2\nraise RuntimeError('here')")
+        err = json.loads(body)["error"]
+        self.assertEqual(err["line"], 3)
+        self.assertIn("RuntimeError", err["traceback"])
+
+    def test_execute_syntax_error(self):
+        _, body = self._req("/execute", token=self.token, method="POST", body="def (")
+        data = json.loads(body)
+        self.assertFalse(data["success"])
+        self.assertEqual(data["error"]["type"], "SyntaxError")
+        self.assertEqual(data["error"]["line"], 1)
+
+    def test_execute_parent_in_scope(self):
+        _, body = self._req("/execute?from_op=/pp/child", token=self.token, method="POST",
+                            body="parent().path")
+        self.assertEqual(json.loads(body)["result"], "/pp")
+
+    # --- v0.4: errors scoping ---
+    def test_errors_scoped_to_path(self):
+        _, body = self._req("/errors?path=/scoped", token=self.token)
+        self.assertEqual(json.loads(body)["path"], "/scoped")
+
+    def test_errors_missing_path_404(self):
+        td_api._td().op("/gone_err").destroy()
+        # op() in the stub auto-creates, so simulate a miss by monkeypatching.
+        orig = td_api._td().op
+        td_api._td().op = lambda p=None: None
+        try:
+            status, _ = self._req("/errors?path=/gone", token=self.token)
+        finally:
+            td_api._td().op = orig
+        self.assertEqual(status, 404)
+
+    # --- v0.4: params ---
+    def test_params_names_filter(self):
+        _, body = self._req("/params?path=/pf&names=tx", token=self.token)
+        self.assertEqual(list(json.loads(body)["params"]), ["tx"])
+
+    def test_params_detail(self):
+        _, body = self._req("/params?path=/pd&detail=1&names=t*", token=self.token)
+        p = json.loads(body)["params"]["tx"]
+        self.assertEqual(p["val"], 0)
+        self.assertEqual(p["mode"], "CONSTANT")
+        self.assertEqual(p["default"], 0)
+
+    def test_params_nondefault(self):
+        self._req("/params?path=/pn", token=self.token, method="PATCH",
+                  body=json.dumps({"ty": 3}), headers={"Content-Type": "application/json"})
+        _, body = self._req("/params?path=/pn&nondefault=1", token=self.token)
+        self.assertEqual(json.loads(body)["params"], {"ty": 3})
+
+    def test_params_write_unknown_is_reported(self):
+        _, body = self._req("/params?path=/pu", token=self.token, method="PATCH",
+                            body=json.dumps({"nope": 1, "tx": 2}),
+                            headers={"Content-Type": "application/json"})
+        data = json.loads(body)
+        self.assertIn("nope", data["failed"])
+        self.assertEqual(data["applied"], {"tx": 2})
+
+    def test_params_write_expr(self):
+        self._req("/params?path=/pe", token=self.token, method="PATCH",
+                  body=json.dumps({"tx": {"expr": "absTime.seconds"}}),
+                  headers={"Content-Type": "application/json"})
+        par = td_api._td().op("/pe").par.tx
+        self.assertEqual(par.expr, "absTime.seconds")
+        self.assertEqual(par.mode, "EXPRESSION")
+
+    def test_params_write_pulse(self):
+        par = td_api._td().op("/pulse_op").par.tx
+        par.isPulse = True
+        self._req("/params?path=/pulse_op", token=self.token, method="PATCH",
+                  body=json.dumps({"tx": True}), headers={"Content-Type": "application/json"})
+        self.assertEqual(td_api._td().op("/pulse_op").par.tx.pulses, 1)
+
+    # --- v0.4: create ---
+    def test_create_with_params_and_bad_input(self):
+        _, body = self._post("/create", {"type": "noiseTOP", "parent": "/", "name": "cp1",
+                                         "params": {"tx": 7, "bogus": 1}, "inputs": []})
+        data = json.loads(body)
+        self.assertEqual(data["params"], {"tx": 7})
+        self.assertTrue(any("bogus" in w for w in data["warnings"]))
+
+    def test_create_places_after_input(self):
+        src = td_api._td().op("/src_for_pos")
+        src.nodeX, src.nodeY = 400, 50
+        _, body = self._post("/create", {"type": "null", "parent": "/", "name": "posd",
+                                         "inputs": ["/src_for_pos"]})
+        self.assertEqual(json.loads(body)["inputs"], ["/src_for_pos"])
+        child = td_api._td().op("/posd")
+        self.assertEqual((child.nodeX, child.nodeY), (600, 50))
+
+    # --- v0.4: info / find / types ---
+    def test_info_reports_wiring(self):
+        self._post("/create", {"type": "base", "parent": "/", "name": "inf"})
+        self._post("/create", {"type": "null", "parent": "/inf", "name": "a"})
+        self._post("/create", {"type": "null", "parent": "/inf", "name": "b"})
+        self._post("/connect", {"from": "/inf/a", "to": "/inf/b"})
+        _, body = self._req("/info?path=/inf/b", token=self.token)
+        data = json.loads(body)
+        self.assertEqual(data["inputs"], [{"index": 0, "path": "/inf/a"}])
+        self.assertEqual(data["parent"], "/inf")
+        self.assertIn("cookTime", data["cook"])
+
+    def test_find_by_name_and_family(self):
+        self._post("/create", {"type": "base", "parent": "/", "name": "fnd"})
+        self._post("/create", {"type": "noise", "parent": "/fnd", "name": "noise1"})
+        self._post("/create", {"type": "noise", "parent": "/fnd", "name": "noise2"})
+        self._post("/create", {"type": "level", "parent": "/fnd", "name": "level1"})
+        _, body = self._req("/find?path=/fnd&name=noise*", token=self.token)
+        data = json.loads(body)
+        self.assertEqual(data["count"], 2)
+        _, body = self._req("/find?path=/fnd&family=chop", token=self.token)
+        self.assertEqual(json.loads(body)["count"], 0)
+        _, body = self._req("/find?path=/fnd&limit=1", token=self.token)
+        data = json.loads(body)
+        self.assertTrue(data["truncated"])
+        self.assertEqual(len(data["operators"]), 1)
+
+    def test_types_filtered(self):
+        _, body = self._req("/types?filter=noise", token=self.token)
+        self.assertEqual(json.loads(body)["types"], {"TOP": ["noiseTOP"], "CHOP": ["noiseCHOP"]})
+        _, body = self._req("/types?family=chop", token=self.token)
+        self.assertEqual(list(json.loads(body)["types"]), ["CHOP"])
+
+    # --- v0.4: dat write ---
+    def test_dat_write_text(self):
+        td_api._td().op("/shader1").family = "DAT"
+        _, body = self._post("/dat/write", {"path": "/shader1", "text": "void main(){}"})
+        self.assertTrue(json.loads(body)["success"])
+        self.assertEqual(td_api._td().op("/shader1").text, "void main(){}")
+
+    def test_dat_write_rows(self):
+        td_api._td().op("/tbl_w").family = "DAT"
+        _, body = self._post("/dat/write", {"path": "/tbl_w", "rows": [["a", 1], ["b", True]]})
+        self.assertEqual(json.loads(body)["numRows"], 2)
+        self.assertEqual(td_api._td().op("/tbl_w").written_rows, [["a", "1"], ["b", "1"]])
+
+    def test_dat_write_rejects_non_dat(self):
+        status, _ = self._post("/dat/write", {"path": "/not_a_dat", "text": "x"})
+        self.assertEqual(status, 400)
+
+    def test_dat_write_requires_exactly_one(self):
+        status, _ = self._post("/dat/write", {"path": "/tbl_w"})
+        self.assertEqual(status, 400)
+
+    # --- v0.4: node / copy / custom par ---
+    def test_node_edits(self):
+        _, body = self._post("/node", {"path": "/nd", "pos": [10, 20], "bypass": True,
+                                       "comment": "hi", "color": [1, 0, 0]})
+        data = json.loads(body)
+        self.assertEqual(data["changed"]["pos"], [10, 20])
+        o = td_api._td().op("/nd")
+        self.assertTrue(o.bypass)
+        self.assertEqual(o.comment, "hi")
+
+    def test_copy_same_parent(self):
+        self._post("/create", {"type": "base", "parent": "/", "name": "cpy"})
+        self._post("/create", {"type": "noise", "parent": "/cpy", "name": "n1"})
+        _, body = self._post("/copy", {"path": "/cpy/n1", "name": "n2"})
+        data = json.loads(body)
+        self.assertEqual(data["copy"]["path"], "/cpy/n2")
+
+    def test_custom_par(self):
+        _, body = self._post("/custom_par", {"path": "/cmp", "name": "speed", "style": "float",
+                                             "min": 0, "max": 10, "default": 2})
+        data = json.loads(body)
+        self.assertEqual(data["params"], ["Speed"])
+        self.assertIn("renamed", data)
+        par = td_api._td().op("/cmp").par.Speed
+        self.assertEqual(par.normMax, 10)
+        self.assertEqual(par.val, 2)
+
+    def test_custom_par_tuplet(self):
+        _, body = self._post("/custom_par", {"path": "/cmp2", "name": "Tint", "style": "rgb"})
+        self.assertEqual(json.loads(body)["params"], ["Tintr", "Tintg", "Tintb"])
+
+    def test_custom_par_bad_style(self):
+        status, _ = self._post("/custom_par", {"path": "/cmp3", "name": "X", "style": "nope"})
+        self.assertEqual(status, 400)
+
+    # --- v0.4: project ---
+    def test_project_get(self):
+        _, body = self._req("/project", token=self.token)
+        data = json.loads(body)
+        self.assertEqual(data["project"]["name"], "test.toe")
+        self.assertEqual(data["app"]["version"], "2025.30000")
+        self.assertIn("frame", data["timeline"])
+
+    def test_project_set_timeline(self):
+        _, body = self._post("/project", {"play": False, "frame": 100})
+        data = json.loads(body)
+        self.assertEqual(data["changed"], {"play": False, "frame": 100.0})
+        self.assertFalse(td_api._td().op("/").time.play)
+
+    # --- v0.4: screenshot jpg ---
+    def test_screenshot_jpg_mime(self):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
+        conn.request("GET", "/screenshot?path=/topJ&format=jpg", headers={
+            "Host": "localhost", "Authorization": f"Bearer {self.token}"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.getheader("Content-Type"), "image/jpeg")
+        resp.read()
+        conn.close()
 
 
 if __name__ == "__main__":

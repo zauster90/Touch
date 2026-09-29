@@ -4,33 +4,55 @@ A Claude Code plugin that exposes TouchDesigner to Claude via MCP: execute Pytho
 
 ## Status
 
-v0.3 — local-only install. Requires TouchDesigner 2025+ and Node 20+. Developed and tested on Windows 11. POSIX paths are handled but unverified end-to-end.
+v0.4 — local-only install. Requires TouchDesigner 2025+ and Node 20+. Developed and tested on Windows 11. POSIX paths are handled but unverified end-to-end.
 
+> **Upgrading to v0.4:** re-run [`toe/install.py`](toe/install.py) (or re-save your `.tox`). The eight new tools are new server endpoints — an old `TouchAPI` answers them with 404. The shim also now bridges `families`/`project`/`app`, which `td_types` and `td_project` need.
+>
 > **Upgrading from v0.1/v0.2:** rebuild the `TouchAPI` component — easiest via [`toe/install.py`](toe/install.py). v0.3 marshals every request onto TD's main cook thread (`bootstrap.onFrameStart` → `drain_main_queue`), which is required for safe op access; it also adds a `td_layout` DAT and the `ParMode` shim bridge. An older `.tox` that lacks the `onFrameStart` drain will accept requests but time them out.
 
 ## What it does
 
-Seventeen MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint hosted inside TouchDesigner:
+Twenty-five MCP tools, each a thin wrapper over a `127.0.0.1`-bound HTTP endpoint hosted inside TouchDesigner.
+
+**Orient & discover**
 
 | Tool | Description | Example prompt |
 |---|---|---|
-| `td_execute` | Run arbitrary Python inside TD. Returns stdout, stderr, and the last expression value. | "Set `op('/project1/geo1').par.tx` to 5." |
+| `td_project` | Project/TD version info, timeline state; play/pause, jump frame, set rate, save. | "Pause the timeline and go to frame 1." |
 | `td_pane` | Current network editor pane: path, pan, zoom. | "What network am I looking at?" |
 | `td_selection` | Operators currently selected. | "What's selected?" |
 | `td_operators` | List children of an operator path. | "List the TOPs under `/project1`." |
-| `td_params` | Read or patch parameters on any operator. | "Set `render1.resolutionw` to 1920." |
-| `td_errors` | All project errors and warnings, walked from root. | "What errors are in the project?" |
-| `td_screenshot` | PNG of a TOP's current frame, returned as an inline image. | "Screenshot the `out1` render TOP." |
+| `td_find` | Recursive search by name/type glob, family, or "has errors". | "Find every GLSL TOP in the project." |
 | `td_graph` | Structured JSON subgraph: nodes + wires, to a given depth. | "Show me the graph under `/project1/comp1`." |
-| `td_create` | Create an operator of a given type under a parent, optionally wired to inputs. | "Add a `noiseTOP` and wire it into `render1`." |
+| `td_info` | One op in depth: inputs *and* outputs, flags, errors, cook stats, resolution / channel names / point counts. | "Why is `render1` black?" |
+| `td_types` | Exact creatable type names (e.g. `audiofileinCHOP`). | "What noise operators exist?" |
+
+**Read data**
+
+| Tool | Description | Example prompt |
+|---|---|---|
+| `td_params` | Read (filter by name, non-default only, or full detail) or patch parameters; supports expressions and pulses. | "Set `render1.resolutionw` to 1920." |
 | `td_chop` | Sample channel data off a CHOP (downsampled, capped). | "What values is `audioanalysis1` outputting?" |
 | `td_dat` | Read a DAT's table cells and raw text. | "Dump the `table1` DAT." |
+| `td_errors` | Errors and warnings under a path (default: whole project). | "What errors are in the project?" |
 | `td_perf` | Slowest-cooking operators under a path, by cook time. | "What's the slowest op in `/project1`?" |
+| `td_screenshot` | PNG or JPEG of a TOP's current frame, returned as an inline image. | "Screenshot the `out1` render TOP." |
+
+**Build & edit**
+
+| Tool | Description | Example prompt |
+|---|---|---|
+| `td_create` | Create an operator, optionally wired to inputs and with params set, auto-placed after its input. | "Add a `noiseTOP` and wire it into `render1`." |
+| `td_copy` | Duplicate an op (or a whole COMP subnet). | "Make a copy of `fx_chain`." |
+| `td_node` | Rename, move, recolor, comment, or toggle bypass/display/render/lock/viewer. | "Bypass `blur1`." |
+| `td_dat_write` | Replace a DAT's text (shaders, scripts) or table rows. | "Rewrite the pixel shader to add a vignette." |
 | `td_connect` | Wire one operator's output into another's input. | "Wire `blur1` into `comp1`'s second input." |
 | `td_disconnect` | Drop wires into an operator's input(s). | "Disconnect `comp1`'s inputs." |
 | `td_delete` | Destroy an operator. | "Delete `noise2`." |
 | `td_bind` | Bind a parameter to an expression (reactive) or constant. | "Drive `geo1.tx` off `op('lfo1')['chan1']`." |
+| `td_custom_par` | Add a custom parameter (float, menu, rgb, pulse, ...) to a COMP. | "Give `fx_chain` a Speed slider from 0 to 10." |
 | `td_layout` | Auto-arrange a subnet (layered DAG / Sugiyama), untangling wire crossings. | "Tidy up the layout under `/project1`." |
+| `td_execute` | Run arbitrary Python inside TD with textport globals. Returns stdout, stderr, and the last expression's value. | "How many instances is `geo1` drawing?" |
 
 ## Security posture
 
@@ -74,7 +96,7 @@ Once the plugin is installed and the component is running, in Claude Code:
 
 1. Select the `TouchAPI` node in TD.
 2. Press the **Rotate token** pulse parameter. TD regenerates the token file and restarts the HTTP server on the new secret.
-3. Restart Claude Code. The MCP server reads the token once at startup and caches it — a rotation without a restart will produce 401s.
+3. That's it — the MCP server re-reads the token file on every request, so the next tool call picks up the new token. No Claude Code restart needed.
 
 ## Development
 
@@ -82,10 +104,10 @@ Clone, install, test, build:
 
 ```bash
 npm install
-npm run test        # 13 TS unit tests (client wrapper)
-python -m pytest tests/python_api_test.py tests/layout_test.py   # 53 Python tests (server core + layout)
+npm run test        # 23 TS unit tests (client wrapper)
+python -m pytest tests/python_api_test.py tests/layout_test.py   # 83 Python tests (server core + layout)
 npm run build       # bundles src/index.ts -> dist/index.js
-npm run smoke       # exercises 9 tools against a live TD (see tests/manual.md)
+npm run smoke       # exercises the read-only tools against a live TD (see tests/manual.md)
 ```
 
 Regenerating the `.tox`: see [`toe/BUILD_TOX.md`](toe/BUILD_TOX.md). After rebuilding, audit the `.tox` with:
@@ -102,7 +124,7 @@ The extractor uses `toeexpand` if available to dump DAT text, which should byte-
 Touch/
 ├── .claude-plugin/plugin.json   # plugin manifest
 ├── .mcp.json                    # MCP server declaration
-├── src/index.ts                 # MCP server + 9 tool wrappers (TS)
+├── src/index.ts                 # MCP server + 25 tool wrappers (TS)
 ├── dist/index.js                # bundled output (built)
 ├── toe/
 │   ├── install.py              # one-shot in-TD builder for the TouchAPI component

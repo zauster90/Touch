@@ -55,6 +55,16 @@ Phrase each prompt naturally to Claude. The "Tool used" column is what Claude sh
 | "Screenshot the `out1` render TOP." | `td_screenshot` | Inline PNG image of the current frame. (Create a `renderTOP` named `out1` first if none exists.) |
 | "Export the graph under `/project1` to depth 2." | `td_graph` | JSON with `nodes[]` and implicit wires via each node's `inputs`. |
 | "Create a `noiseTOP` under `/project1` named `n1`." | `td_create` | New operator appears in the network. Verify visually in TD. |
+| "What TD version and frame are we on? Pause the timeline." | `td_project` | Project/app/timeline info; timeline stops. |
+| "Find every noise operator in the project." | `td_find` | `operators[]` with paths matching `noise*`. |
+| "Tell me everything about `/project1/n1`." | `td_info` | Inputs/outputs, flags, cook stats, `facts.width`/`height`. |
+| "What CHOP types have 'audio' in the name?" | `td_types` | `{ "CHOP": ["audiodeviceinCHOP", ...] }`. |
+| "Create a level TOP after `n1` with brightness 2." | `td_create` (`inputs` + `params`) | New op wired to `n1`, placed to its right, `brightness1` = 2. |
+| "Bypass `n1`, then rename it `noise_bg`." | `td_node` | Bypass flag on; op renamed. |
+| "Duplicate `noise_bg`." | `td_copy` | A copy appears just above the original. |
+| "Write `a\tb` / `1\t2` into `/project1/table1`." | `td_dat_write` (`rows`) | Table shows the new 2×2 contents. |
+| "Add a Speed float (0–10, default 1) to `/project1/base1`." | `td_custom_par` | `Speed` slider on a `Custom` page. |
+| "What's `op('/project1').numChildren`?" | `td_execute` | `result` holds the number — no `print` needed. |
 
 ## 5. Security checks
 
@@ -87,8 +97,7 @@ Run these from a terminal. On Windows, pull the token with `set /p TOKEN=<%APPDA
 2. Verify the token file mtime updated:
    - Windows: `dir %APPDATA%\claude-td\token`
    - POSIX: `stat ~/.config/claude-td/token`
-3. In Claude Code, ask *"Tell me the current TD network path"* — it should fail with a 401 because Claude's MCP server cached the old token at startup.
-4. Restart Claude Code. Ask the same question again — it should succeed with the new token.
+3. In Claude Code, ask *"Tell me the current TD network path"* — it should succeed without restarting Claude Code, because the MCP server re-reads the token file on every request.
 
 ## 7. Teardown
 

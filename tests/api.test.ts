@@ -65,6 +65,17 @@ beforeAll(async () => {
         return res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({success:true, mode:"expression"}));
       if (url.startsWith("/layout"))
         return res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({mode:"preview", target:"/project1", plan:[], broken_edges:[], overlaps:[], excluded:[], stats:{nodes:2}}));
+      const echo = (extra: object = {}) =>
+        res.writeHead(200, {"content-type":"application/json"}).end(JSON.stringify({ok:true, ...extra}));
+      if (url.startsWith("/info")) return echo({path:"/a", inputs:[], outputs:[]});
+      if (url.startsWith("/find")) return echo({count:0, operators:[]});
+      if (url.startsWith("/types")) return echo({types:{TOP:["noiseTOP"]}});
+      if (url.startsWith("/dat/write")) return echo({success:true});
+      if (url.startsWith("/node")) return echo({changed:{}});
+      if (url.startsWith("/copy")) return echo({success:true});
+      if (url.startsWith("/custom_par")) return echo({success:true});
+      if (url.startsWith("/project")) return echo({project:{name:"t.toe"}});
+      if (url.startsWith("/unauthorized")) return res.writeHead(401, "Unauthorized").end();
       res.writeHead(404).end();
     });
   });
@@ -191,5 +202,106 @@ describe("td() client", () => {
     expect(sent.direction).toBe("TB");
     expect(sent.exclude).toEqual(["TouchAPI"]);
     expect(out.content[0].text).toContain('"mode": "preview"');
+  });
+  it("screenshotTool forwards format=jpg", async () => {
+    const { screenshotTool } = await import("../src/index.js");
+    calls.length = 0;
+    await screenshotTool({ path: "/out1", format: "jpg" });
+    expect(calls.at(-1)!.url).toContain("format=jpg");
+  });
+
+  it("paramsTool read forwards names/detail/nondefault filters", async () => {
+    const { paramsTool } = await import("../src/index.js");
+    calls.length = 0;
+    await paramsTool({ path: "/foo", names: ["res*", "tx"], detail: true, nondefault: true });
+    const call = calls.at(-1)!;
+    expect(call.method).toBe("GET");
+    expect(call.url).toContain("names=res*%2Ctx");
+    expect(call.url).toContain("detail=1");
+    expect(call.url).toContain("nondefault=1");
+  });
+
+  it("errorsTool scopes by path", async () => {
+    const { errorsTool } = await import("../src/index.js");
+    calls.length = 0;
+    await errorsTool({ path: "/project1" });
+    expect(calls.at(-1)!.url).toContain("path=%2Fproject1");
+  });
+
+  it("findTool forwards filters", async () => {
+    const { findTool } = await import("../src/index.js");
+    calls.length = 0;
+    await findTool({ path: "/project1", name: "noise*", family: "TOP", errors: true, limit: 5 });
+    const url = calls.at(-1)!.url;
+    expect(url).toContain("name=noise*");
+    expect(url).toContain("family=TOP");
+    expect(url).toContain("errors=1");
+    expect(url).toContain("limit=5");
+  });
+
+  it("infoTool and typesTool GET", async () => {
+    const { infoTool, typesTool } = await import("../src/index.js");
+    calls.length = 0;
+    await infoTool({ path: "/a" });
+    expect(calls.at(-1)!.url).toBe("/info?path=%2Fa");
+    const out = await typesTool({ family: "TOP", filter: "noise" });
+    expect(calls.at(-1)!.url).toContain("filter=noise");
+    expect(out.content[0].text).toContain("noiseTOP");
+  });
+
+  it("mutating tools POST their args as JSON", async () => {
+    const api = await import("../src/index.js");
+    const cases: Array<[string, () => Promise<unknown>, string]> = [
+      ["/dat/write", () => api.datWriteTool({ path: "/s", text: "void main(){}" }), "text"],
+      ["/node", () => api.nodeTool({ path: "/n", bypass: true }), "bypass"],
+      ["/copy", () => api.copyTool({ path: "/n", name: "n2" }), "name"],
+      ["/custom_par", () => api.customParTool({ path: "/c", name: "Speed", style: "float" }), "style"],
+    ];
+    for (const [endpoint, fn, key] of cases) {
+      calls.length = 0;
+      await fn();
+      const call = calls.at(-1)!;
+      expect(call.method).toBe("POST");
+      expect(call.url).toBe(endpoint);
+      expect(JSON.parse(call.body)).toHaveProperty(key);
+    }
+  });
+
+  it("projectTool GETs with no args and POSTs with timeline args", async () => {
+    const { projectTool } = await import("../src/index.js");
+    calls.length = 0;
+    await projectTool();
+    expect(calls.at(-1)!.method).toBe("GET");
+    await projectTool({ play: false });
+    expect(calls.at(-1)!.method).toBe("POST");
+    expect(JSON.parse(calls.at(-1)!.body)).toEqual({ play: false });
+  });
+
+  it("401 error carries a token hint", async () => {
+    const { td } = await import("../src/index.js");
+    await expect(td("/unauthorized")).rejects.toThrow(/Token mismatch/);
+  });
+
+  it("connection refused explains how to start TouchAPI", async () => {
+    const { td } = await import("../src/index.js");
+    const saved = process.env.TDAPI_PORT;
+    const probe = http.createServer();
+    await new Promise<void>((r) => probe.listen(0, "127.0.0.1", r));
+    const deadPort = (probe.address() as AddressInfo).port;
+    await new Promise<void>((r) => probe.close(() => r()));
+    process.env.TDAPI_PORT = String(deadPort);
+    try {
+      await expect(td("/pane")).rejects.toThrow(/TouchAPI component/);
+    } finally {
+      process.env.TDAPI_PORT = saved;
+    }
+  });
+});
+
+describe("dist bundle", () => {
+  it("has exactly one shebang line (node rejects a second one)", () => {
+    const head = fs.readFileSync(path.join(__dirname, "..", "dist", "index.js"), "utf8").split("\n", 3);
+    expect(head[0]).toBe("#!/usr/bin/env node");
+    expect(head[1].startsWith("#!")).toBe(false);
   });
 });

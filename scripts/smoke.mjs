@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/** Calls every MCP tool once against a running TD. Run: `npm run smoke`. */
+/** Calls every read-only MCP tool once against a running TD. Run: `npm run smoke`. */
 import * as api from "../dist/index.js";
 
 const checks = [
@@ -10,7 +10,11 @@ const checks = [
   ["td_params (read)", () => api.paramsTool({ path: "/" })],
   ["td_graph", () => api.graphTool({ path: "/", depth: 1 })],
   ["td_perf", () => api.perfTool({ path: "/", depth: 2 })],
-  ["td_execute", () => api.executeTool({ code: "print('smoke ok')" })],
+  ["td_execute", () => api.executeTool({ code: "print('smoke ok')\n1 + 1" })],
+  ["td_project", () => api.projectTool()],
+  ["td_find", () => api.findTool({ path: "/", depth: 2, limit: 5 })],
+  ["td_info", () => api.infoTool({ path: "/project1" })],
+  ["td_types", () => api.typesTool({ family: "TOP", filter: "noise" })],
 ];
 
 let failed = 0;

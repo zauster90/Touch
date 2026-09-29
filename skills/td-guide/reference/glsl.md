@@ -6,7 +6,7 @@ GLSL in TD appears in three places, each with different I/O conventions. Confusi
 - **GLSL MAT**: a material bound to 3D geometry. Runs vertex + pixel per rendered mesh. Has access to TD's standard lighting uniforms.
 - **GLSL POP** (TD 2025+): compute-style, runs per point in a POP stream.
 
-After editing any GLSL op, call `td_errors` — TD reports compile/link failures there, not in a popup.
+Write shader code with `td_dat_write` (`text`) into the DAT the GLSL op points at (e.g. `glsl1_pixel`). Then call `td_info` or `td_errors` on the **GLSL op itself**, not the DAT. TD reports compile/link failures there, not in a popup.
 
 ## GLSL TOP
 
@@ -32,9 +32,11 @@ void main() {
 Add a custom uniform via `td_params`:
 
 ```json
-{ "op": "/project1/glsl1",
+{ "path": "/project1/glsl1",
   "params": { "uniname0": "uStrength", "value0x": 0.8 } }
 ```
+
+To animate it, pass an expression instead of a number: `"value0x": { "expr": "absTime.seconds % 1" }`.
 
 ## GLSL MAT
 
