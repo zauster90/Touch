@@ -1,11 +1,11 @@
 {
   "name": "touch",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "Claude Code plugin for TouchDesigner — MCP tools for networks, params, rendering, and shaders.",
   "type": "module",
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --banner:js=\"#!/usr/bin/env node\"",
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js",
     "dev": "npm run build -- --watch",
     "test": "vitest run",
     "test:watch": "vitest",

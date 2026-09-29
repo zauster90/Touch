@@ -144,8 +144,14 @@ Endpoint = Callable[["Ctx"], tuple[int, Any]]
 _routes: dict[tuple[str, str], Endpoint] = {}
 
 
-def route(method: str, path: str):
+DEFAULT_TIMEOUT = 5.0
+
+
+def route(method: str, path: str, timeout: float = DEFAULT_TIMEOUT):
+    """Register an endpoint. `timeout` bounds how long the HTTP worker waits
+    for the main thread to run it (long for /execute, short elsewhere)."""
     def deco(fn: Endpoint) -> Endpoint:
+        fn.timeout = timeout  # type: ignore[attr-defined]
         _routes[(method, path)] = fn
         return fn
     return deco
@@ -241,7 +247,16 @@ class TDHandler(BaseHTTPRequestHandler):
         try:
             # Marshal endpoint execution onto TD's main cook thread.
             # TD Python API (op(), ui.*, par access) is not thread-safe.
-            status, payload = run_on_main(lambda: endpoint(ctx))
+            status, payload = run_on_main(
+                lambda: endpoint(ctx), timeout=getattr(endpoint, "timeout", DEFAULT_TIMEOUT))
+        except TimeoutError as exc:
+            # The request is still queued and will run on the next frame; we
+            # just stop waiting. Usually means TD is blocked (modal dialog,
+            # long cook) or the bootstrap's onFrameStart drain isn't firing.
+            log(f"TIMEOUT {self.path}: {exc}")
+            return self._respond(504, {"error": {"type": "Timeout", "message": (
+                f"{exc}. TD's main thread did not pick up the request — check for "
+                "an open dialog, a very long cook, or that TouchAPI/bootstrap is active.")}})
         except Exception as exc:  # noqa: BLE001
             log(f"ERR {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
             return self._respond(500, {"error": {"type": type(exc).__name__, "message": str(exc)}})
@@ -321,6 +336,71 @@ def _op_info(o) -> dict:
     }
 
 
+def _err(status: int, type_: str, message: str) -> tuple[int, dict]:
+    return status, {"error": {"type": type_, "message": message}}
+
+
+def _tdg(name: str, default: Any = None) -> Any:
+    """Look up a TD global (families, project, app, noiseTOP, ...). Prefers the
+    td_runtime shim, then TD's own `td` module; `default` when neither has it."""
+    val = getattr(_td(), name, None)
+    if val is not None:
+        return val
+    try:
+        import td as _tdmod  # type: ignore  # only importable inside TD
+    except ImportError:
+        return default
+    return getattr(_tdmod, name, default)
+
+
+def _is_op(v: Any) -> bool:
+    return v is not None and hasattr(v, "path") and hasattr(v, "family")
+
+
+def _jsonable(v: Any, _depth: int = 0) -> Any:
+    """Coerce a value to plain JSON on the MAIN thread. OPs become their path;
+    containers recurse; anything else unknown becomes its repr."""
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    if _is_op(v):
+        return v.path
+    if _depth > 4:
+        return repr(v)
+    if isinstance(v, dict):
+        return {str(k): _jsonable(x, _depth + 1) for k, x in list(v.items())[:500]}
+    if isinstance(v, (list, tuple, set, deque)):
+        return [_jsonable(x, _depth + 1) for x in list(v)[:500]]
+    name = getattr(v, "name", None)
+    if isinstance(name, str) and type(v).__name__.endswith("Mode"):
+        return name  # enum-ish, e.g. ParMode.EXPRESSION -> "EXPRESSION"
+    try:
+        return repr(v)
+    except Exception:  # noqa: BLE001
+        return f"<{type(v).__name__}>"
+
+
+def _int_q(ctx: "Ctx", key: str, default: int) -> int:
+    raw = ctx.q(key)
+    return default if raw in (None, "") else int(raw)
+
+
+def _connections(o) -> tuple[list[dict], list[dict]]:
+    """(inputs, outputs) wiring of an op as [{index, path}] lists."""
+    ins: list[dict] = []
+    for i, ic in enumerate(getattr(o, "inputConnectors", []) or []):
+        for conn in getattr(ic, "connections", []) or []:
+            owner = getattr(conn, "owner", None)
+            if owner is not None:
+                ins.append({"index": i, "path": getattr(owner, "path", None)})
+    outs: list[dict] = []
+    for i, oc in enumerate(getattr(o, "outputConnectors", []) or []):
+        for conn in getattr(oc, "connections", []) or []:
+            owner = getattr(conn, "owner", None)
+            if owner is not None and owner is not o:
+                outs.append({"index": i, "path": getattr(owner, "path", None)})
+    return ins, outs
+
+
 @route("GET", "/pane")
 def _pane(ctx: Ctx):
     td = _td()
@@ -360,44 +440,85 @@ def _operators(ctx: Ctx):
 
 @route("GET", "/errors")
 def _errors(ctx: Ctx):
+    """Errors + warnings for every op under `path` (default '/'), `depth` deep."""
     td = _td()
-    root = td.op("/")
+    path = ctx.q("path", "/") or "/"
+    root = td.op(path)
     if root is None:
-        return 500, {"error": {"type": "NoRoot", "message": "cannot access op('/')"}}
+        return _err(404, "NotFound", path)
+    try:
+        depth = _int_q(ctx, "depth", 64)
+    except ValueError:
+        return _err(400, "BadInput", "depth must be integer")
     errs: list[dict] = []
     warns: list[dict] = []
-    for n in [root, *root.findChildren(depth=10)]:
+    kids = root.findChildren(depth=depth) if hasattr(root, "findChildren") else []
+    for n in [root, *kids]:
         e = n.errors() or ""
         w = n.warnings() or ""
         if e: errs.append({"path": n.path, "text": e})
         if w: warns.append({"path": n.path, "text": w})
-    return 200, {"errors": errs, "warnings": warns}
+    return 200, {"path": path, "errors": errs, "warnings": warns}
 
 
-@route("POST", "/execute")
+def _exec_scope(td, me) -> dict:
+    """Globals for /execute: everything TD's own textport has (op, parent,
+    absTime, noiseTOP, tdu, ...) when running inside TD, plus `me`."""
+    scope: dict[str, Any] = {}
+    try:
+        import td as _tdmod  # type: ignore  # only importable inside TD
+        scope.update({k: v for k, v in vars(_tdmod).items() if not k.startswith("__")})
+    except ImportError:
+        pass
+    scope.update({"op": td.op, "ops": getattr(td, "ops", None), "ui": td.ui, "me": me})
+    if me is not None and hasattr(me, "parent"):
+        scope["parent"] = me.parent
+    scope["__name__"] = "__td_execute__"
+    return scope
+
+
+def _split_last_expr(code: str):
+    """Compile `code` so a trailing expression's value can be returned, like a
+    REPL: (body_code, last_expr_code_or_None)."""
+    import ast
+    tree = ast.parse(code, "<td_execute>", "exec")
+    if tree.body and isinstance(tree.body[-1], ast.Expr):
+        last = ast.Expression(tree.body.pop().value)
+        return compile(tree, "<td_execute>", "exec"), compile(last, "<td_execute>", "eval")
+    return compile(tree, "<td_execute>", "exec"), None
+
+
+@route("POST", "/execute", timeout=30.0)
 def _execute(ctx: Ctx):
     td = _td()
     code = ctx.body.decode("utf-8")
     from_op = ctx.q("from_op", "/") or "/"
     me = td.op(from_op)
     stdout, stderr = io.StringIO(), io.StringIO()
-    scope = {"op": td.op, "ops": getattr(td, "ops", None), "ui": td.ui, "me": me}
+    scope = _exec_scope(td, me)
+    base = {"stdout": "", "stderr": "", "from_op": from_op}
     try:
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            exec(compile(code, "<td_execute>", "exec"), scope)  # noqa: S102
+            body, last = _split_last_expr(code)
+            exec(body, scope)  # noqa: S102
+            result = eval(last, scope) if last is not None else None  # noqa: S307
         return 200, {
-            "success": True,
-            "stdout": stdout.getvalue(),
-            "stderr": stderr.getvalue(),
-            "from_op": from_op,
+            **base, "success": True,
+            "stdout": stdout.getvalue(), "stderr": stderr.getvalue(),
+            "result": _jsonable(result),
         }
     except Exception as exc:  # noqa: BLE001
+        # Keep only frames from the submitted code — TD/server frames are noise.
+        tb = [ln for ln in traceback.format_exception(exc) if "<td_execute>" in ln or not ln.startswith("  File")]
+        line = getattr(exc, "lineno", None)
+        if line is None:
+            frames = [f for f in traceback.extract_tb(exc.__traceback__) if f.filename == "<td_execute>"]
+            line = frames[-1].lineno if frames else None
         return 200, {
-            "success": False,
-            "stdout": stdout.getvalue(),
-            "stderr": stderr.getvalue(),
-            "from_op": from_op,
-            "error": {"type": type(exc).__name__, "message": str(exc)},
+            **base, "success": False,
+            "stdout": stdout.getvalue(), "stderr": stderr.getvalue(),
+            "error": {"type": type(exc).__name__, "message": str(exc), "line": line,
+                      "traceback": "".join(tb)[-4000:]},
         }
 
 
@@ -505,15 +626,55 @@ def _perf(ctx: Ctx):
 # Endpoints — mutation & complex
 # ---------------------------------------------------------------------------
 
+def _mode_name(par) -> str:
+    m = getattr(par, "mode", None)
+    if m is None:
+        return "CONSTANT"
+    return getattr(m, "name", None) or str(m).rsplit(".", 1)[-1]
+
+
+def _par_detail(par, value: Any) -> dict:
+    d: dict[str, Any] = {"val": value, "mode": _mode_name(par)}
+    for attr in ("expr", "bindExpr", "default", "label", "style", "normMin", "normMax",
+                 "min", "max", "clampMin", "clampMax", "menuNames", "readOnly", "enable"):
+        try:
+            v = getattr(par, attr)
+        except Exception:  # noqa: BLE001
+            continue
+        if v in (None, "") or callable(v):
+            continue
+        d[attr] = _jsonable(v)
+    page = getattr(par, "page", None)
+    if page is not None:
+        d["page"] = getattr(page, "name", None)
+    return d
+
+
+def _is_default(par, value: Any) -> bool:
+    if _mode_name(par) != "CONSTANT":
+        return False
+    try:
+        return value == _jsonable(par.default)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @route("GET", "/params")
 def _params_get(ctx: Ctx):
+    """Parameter values. Filters: `names` (comma-separated globs), `nondefault=1`
+    (only params changed from default or driven by an expression/export).
+    `detail=1` returns mode/expr/default/range/menu info per param."""
+    import fnmatch
     td = _td()
     path = ctx.q("path")
     if not path:
-        return 400, {"error": {"type": "BadInput", "message": "path required"}}
+        return _err(400, "BadInput", "path required")
     o = td.op(path)
     if o is None:
-        return 404, {"error": {"type": "NotFound", "message": path}}
+        return _err(404, "NotFound", path)
+    patterns = [n.strip() for n in (ctx.q("names") or "").split(",") if n.strip()]
+    detail = ctx.q("detail") in ("1", "true")
+    nondefault = ctx.q("nondefault") in ("1", "true")
     # Use `o.pars()` — the canonical TD API for enumerating a node's parameters.
     # `dir(o.par)` returns pseudo-attributes like `owner` (raw OP reference) that
     # leak into the response and trigger TD's cross-thread safety dialog when
@@ -525,17 +686,39 @@ def _params_get(ctx: Ctx):
     except Exception:  # noqa: BLE001
         par_list = []
     for par in par_list:
+        if patterns and not any(fnmatch.fnmatchcase(par.name, pat) for pat in patterns):
+            continue
         try:
-            evaluated = par.eval()
-            # OP-typed pars (TOP/CHOP/COMP/DAT/SOP/MAT/POP) return an OP object;
-            # coerce to its .path here (on the main thread) so the HTTP thread
-            # never touches a TD OP during JSON serialization.
-            if evaluated is not None and hasattr(evaluated, "path") and hasattr(evaluated, "family"):
-                evaluated = evaluated.path
-            pars[par.name] = evaluated
+            # OP-typed pars return an OP object; _jsonable turns it into .path.
+            value = _jsonable(par.eval())
         except Exception:  # noqa: BLE001
-            pass
+            continue
+        if nondefault and _is_default(par, value):
+            continue
+        pars[par.name] = _par_detail(par, value) if detail else value
     return 200, {"path": path, "params": pars}
+
+
+def _set_par(o, name: str, v: Any, td) -> Any:
+    """Apply one PATCH entry. Plain values set the constant; `{"expr": ...}`
+    switches to expression mode; truthy on a pulse par fires it."""
+    par = getattr(o.par, name, None)
+    if par is None:
+        raise KeyError(f"no parameter '{name}' on {getattr(o, 'path', '?')}")
+    par_mode = getattr(td, "ParMode", None)
+    if isinstance(v, dict) and "expr" in v:
+        par.expr = v["expr"]
+        if par_mode is not None:
+            par.mode = par_mode.EXPRESSION
+        return {"expr": v["expr"]}
+    if getattr(par, "isPulse", False) and hasattr(par, "pulse"):
+        if v:
+            par.pulse()
+        return "pulsed" if v else "skipped"
+    par.val = v
+    if par_mode is not None and _mode_name(par) not in ("CONSTANT", "BIND"):
+        par.mode = par_mode.CONSTANT  # a literal value means "stop following the expr"
+    return v
 
 
 @route("PATCH", "/params")
@@ -543,24 +726,22 @@ def _params_set(ctx: Ctx):
     td = _td()
     path = ctx.q("path")
     if not path:
-        return 400, {"error": {"type": "BadInput", "message": "path required"}}
+        return _err(400, "BadInput", "path required")
     o = td.op(path)
     if o is None:
-        return 404, {"error": {"type": "NotFound", "message": path}}
+        return _err(404, "NotFound", path)
     updates = ctx.json() or {}
     applied: dict[str, Any] = {}
+    failed: dict[str, str] = {}
     for k, v in updates.items():
-        par = getattr(o.par, k, None)
         try:
-            if par is not None and hasattr(par, "val"):
-                par.val = v
-            else:
-                # Create-or-set via attribute — _FakeParGroup and TD both support this.
-                setattr(o.par, k, v)
-            applied[k] = v
+            applied[k] = _set_par(o, k, v, td)
         except Exception as exc:  # noqa: BLE001
-            applied[k] = {"error": str(exc)}
-    return 200, {"path": path, "applied": applied}
+            failed[k] = str(exc)
+    body: dict[str, Any] = {"path": path, "applied": applied}
+    if failed:
+        body["failed"] = failed
+    return 200, body
 
 
 @route("POST", "/bind")
@@ -602,6 +783,31 @@ def _bind(ctx: Ctx):
     return 200, {"success": True, "path": path, "param": param, "mode": mode, "expr": expr}
 
 
+def _resolve_type(type_: str) -> Any:
+    """'noiseTOP' -> the noiseTOP class when running in TD, else the string."""
+    cls = _tdg(type_) if isinstance(type_, str) else type_
+    return cls if cls is not None else type_
+
+
+def _all_types() -> dict[str, list[str]]:
+    """{family: [type names]} from TD's `families` global, or by scanning the
+    td module for *TOP / *CHOP / ... classes as a fallback."""
+    fams = _tdg("families")
+    out: dict[str, list[str]] = {}
+    if isinstance(fams, dict):
+        for fam, types in fams.items():
+            out[str(fam)] = sorted(getattr(t, "__name__", str(t)) for t in types)
+        return out
+    try:
+        import td as _tdmod  # type: ignore
+    except ImportError:
+        return out
+    for fam in ("TOP", "CHOP", "SOP", "DAT", "COMP", "MAT", "POP"):
+        out[fam] = sorted(n for n, v in vars(_tdmod).items()
+                          if n.endswith(fam) and n != fam and isinstance(v, type))
+    return out
+
+
 @route("POST", "/create")
 def _create(ctx: Ctx):
     td = _td()
@@ -611,28 +817,64 @@ def _create(ctx: Ctx):
     name = data.get("name")
     pos = data.get("pos")
     inputs = data.get("inputs") or []
+    params = data.get("params") or {}
     if not type_:
-        return 400, {"error": {"type": "BadInput", "message": "type required"}}
+        return _err(400, "BadInput", "type required")
     p = td.op(parent)
     if p is None:
-        return 404, {"error": {"type": "NotFound", "message": parent}}
+        return _err(404, "NotFound", parent)
     if not hasattr(p, "create"):
-        return 500, {"error": {"type": "CreateFailed", "message": "op has no create()"}}
-    child = p.create(type_, name=name)
-    if pos and hasattr(child, "nodeX"):
-        try:
-            child.nodeX, child.nodeY = int(pos[0]), int(pos[1])
-        except Exception:  # noqa: BLE001
-            pass
+        return _err(400, "BadOp", f"{parent} is not a COMP (no create())")
+    if name and hasattr(p, "op") and p.op(name) is not None:
+        return _err(409, "NameTaken", f"{parent}/{name} already exists")
+    try:
+        child = p.create(_resolve_type(type_), name) if name else p.create(_resolve_type(type_))
+    except Exception as exc:  # noqa: BLE001
+        import difflib
+        names = [n for ns in _all_types().values() for n in ns]
+        hint = difflib.get_close_matches(str(type_), names, n=5, cutoff=0.5)
+        msg = f"cannot create '{type_}': {exc}"
+        if hint:
+            msg += f". Did you mean: {', '.join(hint)}?"
+        return _err(400, "CreateFailed", msg)
+
+    warnings: list[str] = []
+    wired: list[str] = []
     for i, src in enumerate(inputs):
         s = td.op(src)
         if s is None:
+            warnings.append(f"input {i}: op not found: {src}")
             continue
         try:
             child.inputConnectors[i].connect(s.outputConnectors[0])
+            wired.append(s.path)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"input {i} ({src}): {exc}")
+
+    if hasattr(child, "nodeX"):
+        try:
+            if pos:
+                child.nodeX, child.nodeY = int(pos[0]), int(pos[1])
+            elif wired:
+                # Drop it just downstream of its first input instead of at the origin.
+                first = td.op(wired[0])
+                child.nodeX, child.nodeY = int(first.nodeX) + 200, int(first.nodeY)
         except Exception:  # noqa: BLE001
             pass
-    return 200, _op_info(child)
+
+    applied: dict[str, Any] = {}
+    for k, v in params.items():
+        try:
+            applied[k] = _set_par(child, k, v, td)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"param {k}: {exc}")
+
+    body: dict[str, Any] = {**_op_info(child), "inputs": wired}
+    if applied:
+        body["params"] = applied
+    if warnings:
+        body["warnings"] = warnings
+    return 200, body
 
 
 @route("POST", "/connect")
@@ -825,16 +1067,22 @@ def _graph(ctx: Ctx):
 
 @route("GET", "/screenshot")
 def _screenshot(ctx: Ctx):
+    """A TOP's current frame. `format=jpg` is ~5-10x smaller than png — use it
+    when you only need to eyeball the result."""
     td = _td()
     path = ctx.q("path")
     if not path:
-        return 400, {"error": {"type": "BadInput", "message": "path required"}}
+        return _err(400, "BadInput", "path required")
     o = td.op(path)
     if o is None:
-        return 404, {"error": {"type": "NotFound", "message": path}}
+        return _err(404, "NotFound", path)
     if not hasattr(o, "save"):
-        return 400, {"error": {"type": "BadOp", "message": "op has no .save (not a TOP?)"}}
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        return _err(400, "BadOp", "op has no .save (not a TOP?)")
+    fmt = (ctx.q("format", "png") or "png").lower()
+    if fmt not in ("png", "jpg", "jpeg"):
+        return _err(400, "BadInput", "format must be png or jpg")
+    ext, mime = (".png", "image/png") if fmt == "png" else (".jpg", "image/jpeg")
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
         tmp = f.name
     try:
         o.save(tmp)
@@ -844,4 +1092,421 @@ def _screenshot(ctx: Ctx):
             os.unlink(tmp)
         except OSError:
             pass
-    return 200, ("image/png", data)
+    return 200, (mime, data)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — inspection & discovery
+# ---------------------------------------------------------------------------
+
+# Family-specific attributes worth surfacing in /info. Read with getattr, so
+# anything missing on a given TD build is simply skipped.
+_FAMILY_ATTRS: dict[str, tuple[str, ...]] = {
+    "TOP": ("width", "height", "aspect", "depth"),
+    "CHOP": ("numChans", "numSamples", "rate", "start", "end", "isTimeSlice"),
+    "SOP": ("numPoints", "numPrims", "numVertices"),
+    "POP": ("numPoints", "numPrims"),
+    "DAT": ("numRows", "numCols", "isTable", "isText"),
+    "COMP": (),
+    "MAT": (),
+}
+_FLAG_ATTRS = ("bypass", "display", "render", "lock", "viewer", "allowCooking", "cloneImmune")
+
+
+def _safe(o, attr: str) -> Any:
+    try:
+        v = getattr(o, attr)
+        return None if callable(v) else _jsonable(v)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@route("GET", "/info")
+def _info(ctx: Ctx):
+    """Everything useful about ONE op in a single call: wiring both ways, flags,
+    errors, cook stats, and family-specific facts (TOP resolution, CHOP channel
+    names, SOP point counts, DAT size, COMP children)."""
+    td = _td()
+    path = ctx.q("path")
+    if not path:
+        return _err(400, "BadInput", "path required")
+    o = td.op(path)
+    if o is None:
+        return _err(404, "NotFound", path)
+    ins, outs = _connections(o)
+    info: dict[str, Any] = {**_op_info(o), "inputs": ins, "outputs": outs}
+    parent = o.parent() if callable(getattr(o, "parent", None)) else None
+    info["parent"] = getattr(parent, "path", None)
+    info["flags"] = {a: v for a in _FLAG_ATTRS if (v := _safe(o, a)) is not None}
+    info["node"] = {a: v for a in ("nodeX", "nodeY", "nodeWidth", "nodeHeight", "color", "comment")
+                    if (v := _safe(o, a)) not in (None, "")}
+    info["cook"] = {a: v for a in ("cookTime", "cpuCookTime", "gpuCookTime", "totalCooks", "cookFrame")
+                    if (v := _safe(o, a)) is not None}
+    errs = o.errors() if hasattr(o, "errors") else ""
+    warns = o.warnings() if hasattr(o, "warnings") else ""
+    if errs: info["errors"] = errs
+    if warns: info["warnings"] = warns
+    family = getattr(o, "family", "") or ""
+    facts = {a: v for a in _FAMILY_ATTRS.get(family, ()) if (v := _safe(o, a)) is not None}
+    if family == "CHOP" and hasattr(o, "chans"):
+        names = [getattr(c, "name", "?") for c in o.chans()]
+        facts["chanNames"] = names[:64]
+        if len(names) > 64:
+            facts["chanNamesTruncated"] = True
+    if family == "COMP":
+        try:
+            kids = o.findChildren(depth=1)
+            facts["numChildren"] = len(kids)
+        except Exception:  # noqa: BLE001
+            pass
+        pages = getattr(o, "customPages", None)
+        if pages:
+            facts["customPages"] = {
+                getattr(pg, "name", "?"): [getattr(pr, "name", "?") for pr in getattr(pg, "pars", [])]
+                for pg in pages
+            }
+    if facts:
+        info["facts"] = facts
+    return 200, info
+
+
+@route("GET", "/find")
+def _find(ctx: Ctx):
+    """Search recursively under `path` by `name` / `type` glob, `family`, and
+    `errors=1` (only ops with errors or warnings). Returns at most `limit`."""
+    import fnmatch
+    td = _td()
+    path = ctx.q("path", "/") or "/"
+    root = td.op(path)
+    if root is None:
+        return _err(404, "NotFound", path)
+    if not hasattr(root, "findChildren"):
+        return _err(400, "BadOp", f"{path} is not a COMP — search from its parent")
+    try:
+        depth = _int_q(ctx, "depth", 64)
+        limit = max(1, min(_int_q(ctx, "limit", 100), 2000))
+    except ValueError:
+        return _err(400, "BadInput", "depth/limit must be integer")
+    name_pat, type_pat = ctx.q("name"), ctx.q("type")
+    family = (ctx.q("family") or "").upper()
+    only_errors = ctx.q("errors") in ("1", "true")
+    hits: list[dict] = []
+    total = 0
+    for n in root.findChildren(depth=depth):
+        if name_pat and not fnmatch.fnmatch(n.name, name_pat):
+            continue
+        if type_pat and not fnmatch.fnmatch(str(getattr(n, "type", "")), type_pat):
+            continue
+        if family and str(getattr(n, "family", "")).upper() != family:
+            continue
+        if only_errors and not ((n.errors() or "") or (n.warnings() or "")):
+            continue
+        total += 1
+        if len(hits) < limit:
+            hits.append(_op_info(n))
+    return 200, {"path": path, "count": total, "truncated": total > limit, "operators": hits}
+
+
+@route("GET", "/types")
+def _types(ctx: Ctx):
+    """Creatable operator type names (for td_create), by family, with an
+    optional substring `filter` (case-insensitive)."""
+    family = (ctx.q("family") or "").upper()
+    needle = (ctx.q("filter") or "").lower()
+    all_types = _all_types()
+    if not all_types:
+        return _err(501, "Unavailable", "operator type list not available (rebuild TouchAPI to export `families`)")
+    out = {
+        fam: [t for t in names if needle in t.lower()]
+        for fam, names in all_types.items()
+        if not family or fam.upper() == family
+    }
+    return 200, {"types": {k: v for k, v in out.items() if v}}
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — editing
+# ---------------------------------------------------------------------------
+
+@route("POST", "/dat/write")
+def _dat_write(ctx: Ctx):
+    """Write a DAT: `text` replaces its contents (shaders, scripts, JSON);
+    `rows` replaces the table (or appends with `append: true`)."""
+    td = _td()
+    data = ctx.json() or {}
+    path = data.get("path")
+    if not path:
+        return _err(400, "BadInput", "path required")
+    o = td.op(path)
+    if o is None:
+        return _err(404, "NotFound", path)
+    text, rows = data.get("text"), data.get("rows")
+    if (text is None) == (rows is None):
+        return _err(400, "BadInput", "pass exactly one of text or rows")
+    if getattr(o, "family", "DAT") != "DAT":
+        return _err(400, "BadOp", f"{path} is a {o.family}, not a DAT")
+    try:
+        if text is not None:
+            o.text = str(text)
+        else:
+            if not isinstance(rows, list) or not all(isinstance(r, list) for r in rows):
+                return _err(400, "BadInput", "rows must be a list of lists")
+            if not data.get("append"):
+                o.clear()
+            for r in rows:
+                o.appendRow([_cell(c) for c in r])
+    except Exception as exc:  # noqa: BLE001
+        return 200, {"success": False, "error": {"type": type(exc).__name__, "message": str(exc)}}
+    return 200, {"success": True, "path": path,
+                 "numRows": getattr(o, "numRows", None), "numCols": getattr(o, "numCols", None)}
+
+
+def _cell(v: Any) -> str:
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    return "" if v is None else str(v)
+
+
+@route("POST", "/node")
+def _node(ctx: Ctx):
+    """Edit an op's node-level state: `name` (rename), `pos` [x, y], `color`
+    [r, g, b] (0-1), `comment`, and flags `bypass/display/render/lock/viewer`."""
+    td = _td()
+    data = ctx.json() or {}
+    path = data.get("path")
+    if not path:
+        return _err(400, "BadInput", "path required")
+    o = td.op(path)
+    if o is None:
+        return _err(404, "NotFound", path)
+    changed: dict[str, Any] = {}
+    failed: dict[str, str] = {}
+
+    def attempt(key: str, fn: Callable[[], Any]) -> None:
+        try:
+            changed[key] = fn()
+        except Exception as exc:  # noqa: BLE001
+            failed[key] = str(exc)
+
+    if "name" in data:
+        def rename():
+            o.name = str(data["name"])
+            return o.name
+        attempt("name", rename)
+    if "pos" in data:
+        def move():
+            o.nodeX, o.nodeY = int(data["pos"][0]), int(data["pos"][1])
+            return [o.nodeX, o.nodeY]
+        attempt("pos", move)
+    if "color" in data:
+        def recolor():
+            o.color = tuple(float(c) for c in data["color"][:3])
+            return list(o.color)
+        attempt("color", recolor)
+    if "comment" in data:
+        def comment():
+            o.comment = str(data["comment"])
+            return o.comment
+        attempt("comment", comment)
+    for flag in ("bypass", "display", "render", "lock", "viewer"):
+        if flag in data:
+            def set_flag(flag=flag):
+                if not hasattr(o, flag):
+                    raise AttributeError(f"{o.family} has no '{flag}' flag")
+                setattr(o, flag, bool(data[flag]))
+                return getattr(o, flag)
+            attempt(flag, set_flag)
+    body: dict[str, Any] = {"path": getattr(o, "path", path), "changed": changed}
+    if failed:
+        body["failed"] = failed
+    return 200, body
+
+
+@route("POST", "/copy")
+def _copy(ctx: Ctx):
+    """Duplicate an op (a COMP copies its whole subnet) into `parent` (default:
+    same parent) with optional `name` and `pos`. Wires are not copied."""
+    td = _td()
+    data = ctx.json() or {}
+    path = data.get("path")
+    if not path:
+        return _err(400, "BadInput", "path required")
+    o = td.op(path)
+    if o is None:
+        return _err(404, "NotFound", path)
+    dest = td.op(data["parent"]) if data.get("parent") else o.parent()
+    if dest is None:
+        return _err(404, "NotFound", data.get("parent") or f"{path} has no parent to copy into")
+    if not hasattr(dest, "copy"):
+        return _err(400, "BadOp", f"{dest.path} is not a COMP (no copy())")
+    name = data.get("name")
+    try:
+        new = dest.copy(o, name=name) if name else dest.copy(o)
+    except Exception as exc:  # noqa: BLE001
+        return _err(400, "CopyFailed", str(exc))
+    pos = data.get("pos")
+    try:
+        if pos:
+            new.nodeX, new.nodeY = int(pos[0]), int(pos[1])
+        elif getattr(dest, "path", None) == getattr(o.parent(), "path", None):
+            new.nodeX, new.nodeY = int(o.nodeX), int(o.nodeY) - 150
+    except Exception:  # noqa: BLE001
+        pass
+    return 200, {"success": True, "source": path, "copy": _op_info(new)}
+
+
+_PAR_STYLES = {
+    "float": "Float", "int": "Int", "toggle": "Toggle", "str": "Str", "menu": "Menu",
+    "strmenu": "StrMenu", "pulse": "Pulse", "momentary": "Momentary", "rgb": "RGB",
+    "rgba": "RGBA", "xy": "XY", "xyz": "XYZ", "xyzw": "XYZW", "uv": "UV", "uvw": "UVW",
+    "wh": "WH", "file": "File", "folder": "Folder", "op": "OP", "comp": "COMP",
+    "top": "TOP", "chop": "CHOP", "sop": "SOP", "dat": "DAT", "mat": "MAT",
+    "python": "Python", "header": "Header",
+}
+
+
+def _custom_par_name(raw: str) -> str:
+    """TD requires custom par names to be Capitalized + lowercase/digits."""
+    clean = "".join(ch for ch in raw if ch.isalnum())
+    if not clean or not clean[0].isalpha():
+        raise ValueError(f"invalid custom parameter name: {raw!r}")
+    return clean[0].upper() + clean[1:].lower()
+
+
+@route("POST", "/custom_par")
+def _custom_par(ctx: Ctx):
+    """Add (or replace) a custom parameter on a COMP — the way to give a
+    component a clean control surface. Values apply to every tuplet member."""
+    td = _td()
+    data = ctx.json() or {}
+    path, raw_name = data.get("path"), data.get("name")
+    if not path or not raw_name:
+        return _err(400, "BadInput", "path and name required")
+    o = td.op(path)
+    if o is None:
+        return _err(404, "NotFound", path)
+    if not hasattr(o, "appendCustomPage"):
+        return _err(400, "BadOp", f"{path} is not a COMP (custom params live on COMPs)")
+    style = _PAR_STYLES.get(str(data.get("style", "float")).lower())
+    if style is None:
+        return _err(400, "BadInput", f"unknown style; use one of {sorted(set(_PAR_STYLES.values()))}")
+    try:
+        name = _custom_par_name(raw_name)
+    except ValueError as exc:
+        return _err(400, "BadInput", str(exc))
+    page_name = data.get("page") or "Custom"
+    page = next((pg for pg in (getattr(o, "customPages", None) or []) if pg.name == page_name), None)
+    if page is None:
+        page = o.appendCustomPage(page_name)
+    kwargs: dict[str, Any] = {"label": data.get("label") or raw_name, "replace": True}
+    if style in ("Float", "Int") and data.get("size"):
+        kwargs["size"] = int(data["size"])
+    try:
+        group = getattr(page, f"append{style}")(name, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        return _err(400, "CreateFailed", f"append{style}: {exc}")
+    warnings: list[str] = []
+
+    def put(par, attr: str, value: Any) -> None:
+        try:
+            setattr(par, attr, value)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"{par.name}.{attr}: {exc}")
+
+    try:
+        members = list(group)  # ParGroup / list of tuplet pars
+    except TypeError:
+        members = [group]
+    for par in members:
+        if "min" in data:
+            put(par, "normMin", data["min"])
+        if "max" in data:
+            put(par, "normMax", data["max"])
+        if data.get("clamp"):
+            for attr, key in (("min", "min"), ("max", "max")):
+                if key in data:
+                    put(par, attr, data[key])
+                    put(par, f"clamp{attr.capitalize()}", True)
+        if "menuNames" in data:
+            put(par, "menuNames", list(data["menuNames"]))
+            put(par, "menuLabels", list(data.get("menuLabels") or data["menuNames"]))
+        if "default" in data:
+            put(par, "default", data["default"])
+            put(par, "val", data["default"])
+    body: dict[str, Any] = {
+        "success": True, "path": path, "page": page_name, "style": style,
+        "params": [getattr(p, "name", name) for p in members],
+    }
+    if name != raw_name:
+        body["renamed"] = f"{raw_name} -> {name} (TD requires Capitalized lowercase names)"
+    if warnings:
+        body["warnings"] = warnings
+    return 200, body
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — project & timeline
+# ---------------------------------------------------------------------------
+
+def _project_state() -> dict:
+    td = _td()
+    project, app = _tdg("project"), _tdg("app")
+    out: dict[str, Any] = {}
+    if project is not None:
+        out["project"] = {a: v for a in ("name", "folder", "saveVersion", "cookRate", "realTime", "performMode")
+                          if (v := _safe(project, a)) is not None}
+    if app is not None:
+        out["app"] = {a: v for a in ("product", "version", "build", "osName", "osVersion")
+                      if (v := _safe(app, a)) is not None}
+    root = td.op("/")
+    t = getattr(root, "time", None) if root is not None else None
+    if t is not None:
+        out["timeline"] = {a: v for a in ("frame", "seconds", "play", "rate", "start", "end", "rangeStart", "rangeEnd")
+                           if (v := _safe(t, a)) is not None}
+    return out
+
+
+@route("GET", "/project")
+def _project_get(ctx: Ctx):
+    """Project name/folder, TD version, cook rate, and timeline state."""
+    return 200, _project_state()
+
+
+@route("POST", "/project", timeout=30.0)
+def _project_set(ctx: Ctx):
+    """Timeline control: `play` (bool), `frame` (jump), `rate` (fps), and
+    `save` (true = save in place, or a .toe path to save as)."""
+    td = _td()
+    data = ctx.json() or {}
+    root = td.op("/")
+    t = getattr(root, "time", None) if root is not None else None
+    changed: dict[str, Any] = {}
+    failed: dict[str, str] = {}
+    for key in ("play", "frame", "rate"):
+        if key not in data:
+            continue
+        try:
+            if t is None:
+                raise RuntimeError("timeline not available")
+            val = bool(data[key]) if key == "play" else float(data[key])
+            setattr(t, key, val)
+            changed[key] = val
+        except Exception as exc:  # noqa: BLE001
+            failed[key] = str(exc)
+    save = data.get("save")
+    if save:
+        try:
+            project = _tdg("project")
+            if project is None:
+                raise RuntimeError("project not available")
+            if isinstance(save, str):
+                project.save(save)
+            else:
+                project.save()
+            changed["save"] = save if isinstance(save, str) else True
+        except Exception as exc:  # noqa: BLE001
+            failed["save"] = str(exc)
+    body: dict[str, Any] = {"changed": changed, **_project_state()}
+    if failed:
+        body["failed"] = failed
+    return 200, body

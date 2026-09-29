@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-#!/usr/bin/env node
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -21037,14 +21036,33 @@ function loadToken() {
   }
   return fs.readFileSync(p, "utf8").trim();
 }
+var STATUS_HINTS = {
+  401: "Token mismatch \u2014 the TouchAPI token was rotated or regenerated. The token file is re-read on every call, so just retry; if it persists, rebuild TouchAPI.",
+  403: "Host header rejected \u2014 requests must target localhost/127.0.0.1.",
+  404: "Unknown endpoint or operator. If the endpoint is new, rebuild the TouchAPI component from toe/install.py.",
+  504: "TouchDesigner's main thread didn't pick up the request in time \u2014 check for an open dialog or a very long cook."
+};
 async function td(endpoint, init = {}) {
   const url = `http://${HOST}:${getPort()}${endpoint}`;
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${loadToken()}`);
-  const res = await fetch(url, { ...init, headers });
+  let res;
+  try {
+    res = await fetch(url, { ...init, headers });
+  } catch (e) {
+    const code = e?.cause?.code ?? e?.cause?.errors?.[0]?.code ?? e?.code;
+    if (code === "ECONNREFUSED" || code === "ECONNRESET") {
+      throw new Error(
+        `Can't reach TouchDesigner at ${HOST}:${getPort()} (${code}). Is TD open with the TouchAPI component loaded and its Status reading READY?`
+      );
+    }
+    throw e;
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`${res.status} ${res.statusText}${text ? `: ${text}` : ""}`);
+    const hint = STATUS_HINTS[res.status];
+    throw new Error(`${res.status} ${res.statusText}${text ? `: ${text}` : ""}${hint ? `
+${hint}` : ""}`);
   }
   const ct = res.headers.get("content-type") ?? "";
   if (ct.startsWith("image/")) {
@@ -21073,23 +21091,29 @@ async function selectionTool() {
 async function operatorsTool({ path: p } = {}) {
   return asText(await td(`/operators?path=${encodeURIComponent(p ?? "/")}`));
 }
-async function paramsTool({ path: p, params }) {
-  const q = `?path=${encodeURIComponent(p)}`;
+async function paramsTool({ path: p, params, names, detail, nondefault }) {
   if (params !== void 0) {
-    return asText(await td(`/params${q}`, {
+    return asText(await td(`/params?${new URLSearchParams({ path: p })}`, {
       method: "PATCH",
       body: JSON.stringify(params),
       headers: { "Content-Type": "application/json" }
     }));
   }
-  return asText(await td(`/params${q}`));
+  const q = new URLSearchParams({ path: p });
+  if (names?.length) q.set("names", names.join(","));
+  if (detail) q.set("detail", "1");
+  if (nondefault) q.set("nondefault", "1");
+  return asText(await td(`/params?${q}`));
 }
-async function errorsTool() {
-  return asText(await td("/errors"));
+async function errorsTool({ path: p, depth } = {}) {
+  const q = new URLSearchParams({ path: p ?? "/" });
+  if (depth !== void 0) q.set("depth", String(depth));
+  return asText(await td(`/errors?${q}`));
 }
-async function screenshotTool({ path: p }) {
-  const q = `?path=${encodeURIComponent(p)}`;
-  const r = await td(`/screenshot${q}`);
+async function screenshotTool({ path: p, format }) {
+  const q = new URLSearchParams({ path: p });
+  if (format) q.set("format", format);
+  const r = await td(`/screenshot?${q}`);
   if (!isBinary(r)) return asText(r);
   return {
     content: [
@@ -21142,13 +21166,55 @@ async function bindTool(args) {
 async function layoutTool(args) {
   return asText(await postJson("/layout", args));
 }
+async function infoTool({ path: p }) {
+  return asText(await td(`/info?${new URLSearchParams({ path: p })}`));
+}
+async function findTool(args = {}) {
+  const q = new URLSearchParams({ path: args.path ?? "/" });
+  if (args.name) q.set("name", args.name);
+  if (args.type) q.set("type", args.type);
+  if (args.family) q.set("family", args.family);
+  if (args.errors) q.set("errors", "1");
+  if (args.depth !== void 0) q.set("depth", String(args.depth));
+  if (args.limit !== void 0) q.set("limit", String(args.limit));
+  return asText(await td(`/find?${q}`));
+}
+async function typesTool({ family, filter } = {}) {
+  const q = new URLSearchParams();
+  if (family) q.set("family", family);
+  if (filter) q.set("filter", filter);
+  return asText(await td(`/types?${q}`));
+}
+async function datWriteTool(args) {
+  return asText(await postJson("/dat/write", args));
+}
+async function nodeTool(args) {
+  return asText(await postJson("/node", args));
+}
+async function copyTool(args) {
+  return asText(await postJson("/copy", args));
+}
+async function customParTool(args) {
+  return asText(await postJson("/custom_par", args));
+}
+async function projectTool(args = {}) {
+  const mutating = Object.values(args).some((v) => v !== void 0);
+  return asText(mutating ? await postJson("/project", args) : await td("/project"));
+}
+var opPath = external_exports.string().describe("Absolute operator path, e.g. '/project1/noise1'");
+var xy = external_exports.tuple([external_exports.number(), external_exports.number()]);
 function buildServer() {
-  const server = new McpServer({ name: "touch", version: "0.3.0" });
-  server.registerTool("td_execute", {
-    title: "Execute Python in TouchDesigner",
-    description: "Run Python code inside TD. `me` refers to the from_op context operator.",
-    inputSchema: { code: external_exports.string(), from_op: external_exports.string().optional() }
-  }, executeTool);
+  const server = new McpServer({ name: "touch", version: "0.4.0" });
+  server.registerTool("td_project", {
+    title: "Project info & timeline control",
+    description: "With no args: project name/folder, TD version, cook rate, timeline (frame, play, rate). Pass `play`, `frame`, or `rate` to drive the timeline, or `save` (true = in place, or a .toe path) to save the project.",
+    inputSchema: {
+      play: external_exports.boolean().optional().describe("true = play, false = pause"),
+      frame: external_exports.number().optional().describe("Jump the timeline to this frame"),
+      rate: external_exports.number().optional().describe("Timeline FPS"),
+      save: external_exports.union([external_exports.boolean(), external_exports.string()]).optional().describe("true = save in place; a string = save as that .toe path")
+    }
+  }, projectTool);
   server.registerTool("td_pane", {
     title: "Get network editor pane state",
     description: "Current pane: networkPath, x, y, zoom.",
@@ -21164,52 +21230,116 @@ function buildServer() {
     description: "List direct children of the operator at `path` (default '/').",
     inputSchema: { path: external_exports.string().optional() }
   }, operatorsTool);
-  server.registerTool("td_params", {
-    title: "Read or write parameters",
-    description: "Read params (omit `params`) or patch them (`{ tx: 5 }` style).",
-    inputSchema: { path: external_exports.string(), params: external_exports.record(external_exports.any()).optional() }
-  }, paramsTool);
-  server.registerTool("td_errors", {
-    title: "Get project errors and warnings",
-    description: "Walks the project tree and returns any TD errors/warnings.",
-    inputSchema: {}
-  }, errorsTool);
-  server.registerTool("td_screenshot", {
-    title: "Screenshot a TOP",
-    description: "Returns a PNG of a TOP's current frame for visual inspection.",
-    inputSchema: { path: external_exports.string(), width: external_exports.number().optional(), height: external_exports.number().optional() }
-  }, screenshotTool);
+  server.registerTool("td_find", {
+    title: "Search for operators",
+    description: "Recursive search under `path` (default '/'). Filter by `name`/`type` glob (e.g. 'noise*', '*TOP'), `family` (TOP, CHOP, SOP, DAT, COMP, MAT, POP), or `errors: true` for only ops with errors/warnings. Cheaper than td_graph when you know what you're looking for.",
+    inputSchema: {
+      path: external_exports.string().optional(),
+      name: external_exports.string().optional().describe("fnmatch glob on op name"),
+      type: external_exports.string().optional().describe("fnmatch glob on op type, e.g. 'glsl*'"),
+      family: external_exports.string().optional(),
+      errors: external_exports.boolean().optional(),
+      depth: external_exports.number().optional().describe("Recursion depth (default 64)"),
+      limit: external_exports.number().optional().describe("Max results (default 100)")
+    }
+  }, findTool);
   server.registerTool("td_graph", {
     title: "Export a subgraph as JSON",
     description: "Structured graph of a subnet: nodes + implied wires via `inputs`.",
     inputSchema: { path: external_exports.string().optional(), depth: external_exports.number().optional() }
   }, graphTool);
-  server.registerTool("td_create", {
-    title: "Create an operator",
-    description: "Create an operator of `type` under `parent`; optional `name`, `pos`, and `inputs` (paths to wire).",
+  server.registerTool("td_info", {
+    title: "Inspect one operator",
+    description: "Everything about one op in one call: inputs AND outputs (who it feeds), flags (bypass/display/render/lock), errors/warnings, cook stats, and family facts \u2014 TOP resolution, CHOP channel names/sample rate, SOP point counts, DAT size, COMP children + custom pages. Start here when debugging a specific node.",
+    inputSchema: { path: opPath }
+  }, infoTool);
+  server.registerTool("td_types", {
+    title: "List creatable operator types",
+    description: "Exact type names for td_create (e.g. 'noiseTOP', 'audiofileinCHOP'), optionally by `family` and substring `filter`. Use this instead of guessing a type name.",
     inputSchema: {
-      type: external_exports.string(),
-      parent: external_exports.string(),
-      name: external_exports.string().optional(),
-      pos: external_exports.tuple([external_exports.number(), external_exports.number()]).optional(),
-      inputs: external_exports.array(external_exports.string()).optional()
+      family: external_exports.string().optional().describe("TOP, CHOP, SOP, DAT, COMP, MAT, POP"),
+      filter: external_exports.string().optional().describe("Case-insensitive substring, e.g. 'noise'")
     }
-  }, createTool);
+  }, typesTool);
+  server.registerTool("td_params", {
+    title: "Read or write parameters",
+    description: "Read: omit `params`. Narrow with `names` (globs like 'res*'), `nondefault: true` (only changed/expression-driven pars), and `detail: true` (mode, expr, default, range, menu options). Write: `params: { tx: 5, resolutionw: 1920 }`. A value `{ expr: \"absTime.seconds\" }` sets an expression; `true` on a pulse param (reset, reload, ...) fires it. Unknown params are reported under `failed`.",
+    inputSchema: {
+      path: opPath,
+      params: external_exports.record(external_exports.any()).optional().describe("Params to write; omit to read"),
+      names: external_exports.array(external_exports.string()).optional(),
+      detail: external_exports.boolean().optional(),
+      nondefault: external_exports.boolean().optional()
+    }
+  }, paramsTool);
   server.registerTool("td_chop", {
     title: "Read CHOP channel data",
     description: "Sample channels off a CHOP. Optional `chan` name filter and `samples` cap (default 16). See the actual numbers flowing through the network.",
-    inputSchema: { path: external_exports.string(), chan: external_exports.string().optional(), samples: external_exports.number().optional() }
+    inputSchema: { path: opPath, chan: external_exports.string().optional(), samples: external_exports.number().optional() }
   }, chopTool);
   server.registerTool("td_dat", {
     title: "Read DAT table contents",
     description: "Read a DAT's cells (capped by `rows`/`cols`) plus its raw text.",
-    inputSchema: { path: external_exports.string(), rows: external_exports.number().optional(), cols: external_exports.number().optional() }
+    inputSchema: { path: opPath, rows: external_exports.number().optional(), cols: external_exports.number().optional() }
   }, datTool);
+  server.registerTool("td_errors", {
+    title: "Get project errors and warnings",
+    description: "Errors/warnings for every op under `path` (default '/', the whole project).",
+    inputSchema: { path: external_exports.string().optional(), depth: external_exports.number().optional() }
+  }, errorsTool);
   server.registerTool("td_perf", {
     title: "Probe cook performance",
     description: "Slowest-cooking operators under `path`, by last cook time (ms). Use to find what to optimize.",
     inputSchema: { path: external_exports.string().optional(), depth: external_exports.number().optional(), top: external_exports.number().optional() }
   }, perfTool);
+  server.registerTool("td_screenshot", {
+    title: "Screenshot a TOP",
+    description: "Image of a TOP's current frame for visual inspection. `format: 'jpg'` is much smaller than png \u2014 prefer it for quick checks.",
+    inputSchema: { path: opPath, format: external_exports.enum(["png", "jpg"]).optional() }
+  }, screenshotTool);
+  server.registerTool("td_create", {
+    title: "Create an operator",
+    description: "Create an operator of `type` (e.g. 'noiseTOP' \u2014 see td_types) under `parent`. Optional `name`, `pos`, `inputs` (paths wired to inputs 0..n), and `params` (same format as td_params writes). Without `pos`, it's placed just right of its first input. Wiring/param problems come back as `warnings`.",
+    inputSchema: {
+      type: external_exports.string(),
+      parent: external_exports.string(),
+      name: external_exports.string().optional(),
+      pos: xy.optional(),
+      inputs: external_exports.array(external_exports.string()).optional(),
+      params: external_exports.record(external_exports.any()).optional()
+    }
+  }, createTool);
+  server.registerTool("td_copy", {
+    title: "Duplicate an operator",
+    description: "Copy an op (COMPs copy their whole subnet) into `parent` (default: same parent) as `name`. Wires are not copied.",
+    inputSchema: { path: opPath, parent: external_exports.string().optional(), name: external_exports.string().optional(), pos: xy.optional() }
+  }, copyTool);
+  server.registerTool("td_node", {
+    title: "Edit node state",
+    description: "Rename (`name`), move (`pos`), recolor (`color` [r,g,b] 0-1), annotate (`comment`), or toggle flags (`bypass`, `display`, `render`, `lock`, `viewer`) on an op.",
+    inputSchema: {
+      path: opPath,
+      name: external_exports.string().optional(),
+      pos: xy.optional(),
+      color: external_exports.tuple([external_exports.number(), external_exports.number(), external_exports.number()]).optional(),
+      comment: external_exports.string().optional(),
+      bypass: external_exports.boolean().optional(),
+      display: external_exports.boolean().optional(),
+      render: external_exports.boolean().optional(),
+      lock: external_exports.boolean().optional(),
+      viewer: external_exports.boolean().optional()
+    }
+  }, nodeTool);
+  server.registerTool("td_dat_write", {
+    title: "Write DAT contents",
+    description: "Replace a DAT's `text` (GLSL shaders, Python scripts, JSON) or its table `rows` (list of lists; `append: true` to add). After writing a shader, check td_info/td_errors on the GLSL op for compile errors.",
+    inputSchema: {
+      path: opPath,
+      text: external_exports.string().optional(),
+      rows: external_exports.array(external_exports.array(external_exports.any())).optional(),
+      append: external_exports.boolean().optional()
+    }
+  }, datWriteTool);
   server.registerTool("td_connect", {
     title: "Wire two operators",
     description: "Connect `from` op's output into `to` op's input. Indices default to 0.",
@@ -21228,19 +21358,37 @@ function buildServer() {
   server.registerTool("td_delete", {
     title: "Delete an operator",
     description: "Destroy the operator at `path`. Read the graph first \u2014 this is irreversible without TD undo.",
-    inputSchema: { path: external_exports.string() }
+    inputSchema: { path: opPath }
   }, deleteTool);
   server.registerTool("td_bind", {
     title: "Bind a parameter reactively",
     description: "Make a parameter reactive. mode 'expression' (default) sets an expr like \"op('audio')['rms']\"; mode 'constant' sets a fixed `val`.",
     inputSchema: {
-      path: external_exports.string(),
+      path: opPath,
       param: external_exports.string(),
       expr: external_exports.string().optional(),
       mode: external_exports.enum(["expression", "constant"]).optional(),
       val: external_exports.any().optional()
     }
   }, bindTool);
+  server.registerTool("td_custom_par", {
+    title: "Add a custom parameter to a COMP",
+    description: "Give a COMP a control surface: adds (or replaces) a custom parameter on `page` (default 'Custom'). `style`: float, int, toggle, str, menu, strmenu, pulse, rgb, rgba, xy, xyz, file, folder, op, top, chop, python, header... `name` is normalized to TD's Capitalized form. Set `min`/`max` (slider range; `clamp: true` to enforce), `default`, `size` (float/int tuples), `menuNames`/`menuLabels`. Reference it as op('comp').par.<Name>.",
+    inputSchema: {
+      path: opPath,
+      name: external_exports.string(),
+      style: external_exports.string().optional(),
+      page: external_exports.string().optional(),
+      label: external_exports.string().optional(),
+      size: external_exports.number().optional(),
+      default: external_exports.any().optional(),
+      min: external_exports.number().optional(),
+      max: external_exports.number().optional(),
+      clamp: external_exports.boolean().optional(),
+      menuNames: external_exports.array(external_exports.string()).optional(),
+      menuLabels: external_exports.array(external_exports.string()).optional()
+    }
+  }, customParTool);
   server.registerTool("td_layout", {
     title: "Auto-arrange a subnet",
     description: "Layered DAG layout (Sugiyama) of the direct children of `path`. Reads wires + tile sizes and untangles crossings. Returns a preview `plan` by default; pass `apply: true` to write nodeX/nodeY. Use `exclude` (names/paths) or `selection_only` to scope it.",
@@ -21255,6 +21403,14 @@ function buildServer() {
       exclude: external_exports.array(external_exports.string()).optional()
     }
   }, layoutTool);
+  server.registerTool("td_execute", {
+    title: "Execute Python in TouchDesigner",
+    description: "Run Python inside TD with the textport's globals (op, parent, absTime, tdu, noiseTOP, ...). `me` is the `from_op` operator (default '/'). Returns stdout, stderr, and `result` \u2014 the value of the last line if it's an expression (OPs come back as their path). Errors include the failing `line` and a trimmed traceback. Prefer the structured tools when one fits.",
+    inputSchema: {
+      code: external_exports.string(),
+      from_op: external_exports.string().optional().describe("Operator path bound to `me`")
+    }
+  }, executeTool);
   return server;
 }
 async function main() {
@@ -21273,19 +21429,27 @@ export {
   bindTool,
   chopTool,
   connectTool,
+  copyTool,
   createTool,
+  customParTool,
   datTool,
+  datWriteTool,
   deleteTool,
   disconnectTool,
   errorsTool,
   executeTool,
+  findTool,
   graphTool,
+  infoTool,
   layoutTool,
+  nodeTool,
   operatorsTool,
   paneTool,
   paramsTool,
   perfTool,
+  projectTool,
   screenshotTool,
   selectionTool,
-  td
+  td,
+  typesTool
 };
